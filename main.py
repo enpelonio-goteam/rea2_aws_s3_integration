@@ -60,7 +60,12 @@ except Exception as e:
 @app.get("/")
 async def root():
     logger.info("Root endpoint accessed")
-    return {"message": "HTML to S3 Uploader API", "status": "running"}
+    return {
+        "message": "HTML to S3 Uploader API", 
+        "status": "running",
+        "aws_configured": bool(AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY and S3_BUCKET_NAME),
+        "timestamp": datetime.now().isoformat()
+    }
 
 @app.post("/upload-html")
 async def upload_html(request: HTMLUploadRequest):
