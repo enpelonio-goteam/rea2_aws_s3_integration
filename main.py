@@ -18,8 +18,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler('app.log')
+        logging.StreamHandler()
     ]
 )
 logger = logging.getLogger(__name__)
@@ -45,14 +44,18 @@ logger.info(f"AWS Secret Access Key configured: {'Yes' if AWS_SECRET_ACCESS_KEY 
 logger.info(f"Environment variables loaded from .env file")
 
 # Initialize S3 client
+s3_client = None
 try:
-    s3_client = boto3.client(
-        's3',
-        aws_access_key_id=AWS_ACCESS_KEY_ID,
-        aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
-        region_name=AWS_REGION
-    )
-    logger.info("S3 client initialized successfully")
+    if AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY and S3_BUCKET_NAME:
+        s3_client = boto3.client(
+            's3',
+            aws_access_key_id=AWS_ACCESS_KEY_ID,
+            aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+            region_name=AWS_REGION
+        )
+        logger.info("S3 client initialized successfully")
+    else:
+        logger.warning("AWS credentials not fully configured - S3 operations will fail")
 except Exception as e:
     logger.error(f"Failed to initialize S3 client: {e}")
     s3_client = None
@@ -87,6 +90,14 @@ async def upload_html(request: HTMLUploadRequest):
             raise HTTPException(
                 status_code=500, 
                 detail="AWS credentials or bucket name not configured"
+            )
+        
+        # Check if S3 client is available
+        if not s3_client:
+            logger.error("S3 client not initialized")
+            raise HTTPException(
+                status_code=500,
+                detail="S3 client not available - check AWS configuration"
             )
         
         logger.info(f"Request details: {request}")
