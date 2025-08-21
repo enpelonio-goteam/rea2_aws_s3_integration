@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, HTTPException, UploadFile, File, Header
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import boto3
@@ -9,6 +9,9 @@ from typing import Optional
 import json
 import logging
 from dotenv import load_dotenv
+import requests
+import base64
+import io
 
 # Load environment variables from .env file
 load_dotenv()
@@ -29,7 +32,12 @@ class HTMLUploadRequest(BaseModel):
     filename: Optional[str] = None
     content_type: str = "text/html"
 
-app = FastAPI(title="HTML to S3 Uploader", version="1.0.0")
+class ImageGenerationRequest(BaseModel):
+    prompt: str
+    size: Optional[str] = "1024x1024"
+    quality: Optional[str] = "auto"
+
+app = FastAPI(title="Logic Provider Functions", version="1.0.0")
 
 # AWS S3 configuration
 AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
@@ -64,8 +72,9 @@ except Exception as e:
 async def root():
     logger.info("Root endpoint accessed")
     return {
-        "message": "HTML to S3 Uploader API", 
+        "message": "Logic Provider Functions API", 
         "status": "running",
+        "endpoints": ["/upload-html", "/generate-image", "/health"],
         "aws_configured": bool(AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY and S3_BUCKET_NAME),
         "timestamp": datetime.now().isoformat()
     }
@@ -156,6 +165,149 @@ async def upload_html(request: HTMLUploadRequest):
         raise HTTPException(
             status_code=500,
             detail=f"Failed to upload HTML content: {str(e)}"
+        )
+
+@app.post("/generate-image")
+async def generate_image(
+    request: ImageGenerationRequest,
+    authorization: Optional[str] = Header(None)
+):
+    """
+    Generate an image using OpenAI's DALL-E API and save it to S3
+    
+    Args:
+        request: ImageGenerationRequest containing prompt and optional size/quality
+        authorization: Bearer token for OpenAI API access
+    
+    Returns:
+        JSON response with generation status and S3 URL
+    """
+    logger.info(f"Image generation request received - Prompt length: {len(request.prompt)}")
+    
+    try:
+        # Validate authorization header
+        if not authorization or not authorization.lower().startswith("bearer "):
+            logger.error("Missing or invalid authorization header")
+            raise HTTPException(
+                status_code=401,
+                detail="Authorization header with Bearer token is required"
+            )
+        
+        # Extract API key from authorization header (case insensitive)
+        api_key = authorization.split(" ", 1)[1].strip()
+        
+        # Validate required AWS environment variables
+        if not all([AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, S3_BUCKET_NAME]):
+            logger.error("Missing required AWS environment variables")
+            raise HTTPException(
+                status_code=500,
+                detail="AWS credentials or bucket name not configured"
+            )
+        
+        # Check if S3 client is available
+        if not s3_client:
+            logger.error("S3 client not initialized")
+            raise HTTPException(
+                status_code=500,
+                detail="S3 client not available - check AWS configuration"
+            )
+        
+        # Prepare OpenAI API request
+        openai_url = "https://api.openai.com/v1/images/generations"
+        openai_headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        }
+        
+        openai_payload = {
+            "model": "gpt-image-1",
+            "prompt": request.prompt,
+            "size": request.size,
+            "quality": request.quality
+        }
+        
+        logger.info(f"Making request to OpenAI API with payload: {openai_payload}")
+        
+        # Make request to OpenAI API
+        response = requests.post(
+            openai_url,
+            headers=openai_headers,
+            json=openai_payload,
+            timeout=60  # 60 second timeout for image generation
+        )
+        
+        if response.status_code != 200:
+            logger.error(f"OpenAI API error: {response.status_code} - {response.text}")
+            raise HTTPException(
+                status_code=response.status_code,
+                detail=f"OpenAI API error: {response.text}"
+            )
+        
+        response_data = response.json()
+        logger.info(f"OpenAI API response received successfully")
+        
+        # Extract base64 image data
+        if not response_data.get("data") or len(response_data["data"]) == 0:
+            logger.error("No image data returned from OpenAI API")
+            raise HTTPException(
+                status_code=500,
+                detail="No image data returned from OpenAI API"
+            )
+        
+        b64_json = response_data["data"][0]["b64_json"]
+        
+        # Decode base64 image
+        image_data = base64.b64decode(b64_json)
+        
+        # Generate filename
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        unique_id = str(uuid.uuid4())[:8]
+        filename = f"ai-generated-images/image_{timestamp}_{unique_id}.png"
+        
+        logger.info(f"Attempting to upload image to S3 - Bucket: {S3_BUCKET_NAME}, Key: {filename}")
+        
+        # Upload to S3
+        s3_client.put_object(
+            Bucket=S3_BUCKET_NAME,
+            Key=filename,
+            Body=image_data,
+            ContentType="image/png",
+            ACL='public-read'  # Make the object publicly readable
+        )
+        
+        logger.info(f"Successfully uploaded image to S3: {filename}")
+        
+        # Generate public URL
+        public_url = f"https://{S3_BUCKET_NAME}.s3.{AWS_REGION}.amazonaws.com/{filename}"
+        logger.info(f"Generated public URL: {public_url}")
+        
+        response_result = {
+            "success": True,
+            "message": "Image generated and uploaded successfully",
+            "public_url": public_url,
+            "prompt": request.prompt,
+            "size": request.size,
+            "quality": request.quality,
+            "generated_at": datetime.now().isoformat(),
+        }
+        
+        logger.info(f"Image generation successful - returning response")
+        return JSONResponse(
+            status_code=200,
+            content=response_result
+        )
+        
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Request error during OpenAI API call: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to connect to OpenAI API: {str(e)}"
+        )
+    except Exception as e:
+        logger.error(f"Error during image generation: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to generate image: {str(e)}"
         )
 
 @app.get("/health")
