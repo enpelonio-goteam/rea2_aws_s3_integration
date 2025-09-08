@@ -137,10 +137,14 @@ async def upload_html(request: HTMLUploadRequest):
         if not filename:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             unique_id = str(uuid.uuid4())[:8]
-            filename = f"html_{timestamp}_{unique_id}.html"
+            filename = f"html/html_{timestamp}_{unique_id}.html"
             logger.info(f"Generated filename: {filename}")
-        elif not filename.endswith('.html'):
-            filename += '.html'
+        else:
+            # Ensure filename has html/ prefix and .html extension
+            if not filename.startswith("html/"):
+                filename = f"html/{filename}"
+            if not filename.endswith('.html'):
+                filename += '.html'
             logger.info(f"Adjusted filename: {filename}")
         
         logger.info(f"Attempting to upload to S3 - Bucket: {S3_BUCKET_NAME}, Key: {filename}")

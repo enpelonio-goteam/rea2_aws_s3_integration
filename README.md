@@ -89,11 +89,11 @@ curl -X POST "https://your-vercel-app.vercel.app/upload-html" \
 {
   "success": true,
   "message": "HTML content uploaded successfully",
-  "filename": "my-page.html",
-  "public_url": "https://your-bucket.s3.us-east-1.amazonaws.com/my-page.html",
+  "filename": "html/my-page.html",
+  "public_url": "https://your-bucket.s3.us-east-1.amazonaws.com/html/my-page.html",
   "bucket": "your-bucket",
   "region": "us-east-1",
-  "key": "my-page.html",
+  "key": "html/my-page.html",
   "uploaded_at": "2024-01-15T10:30:00.000000"
 }
 ```
