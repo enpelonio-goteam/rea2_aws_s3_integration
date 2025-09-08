@@ -45,6 +45,12 @@ class LoomVideoRequest(BaseModel):
     loom_url: str
     filename: Optional[str] = None
 
+class LinkedInVideoRequest(BaseModel):
+    video_url: str  # URL of the video to upload
+    caption: str
+    visibility: Optional[str] = "PUBLIC"  # PUBLIC, CONNECTIONS, or LOGGED_IN
+    filename: Optional[str] = None
+
 app = FastAPI(title="Logic Provider Functions", version="1.0.0")
 
 # AWS S3 configuration
@@ -91,7 +97,7 @@ async def root():
     return {
         "message": "Logic Provider Functions API", 
         "status": "running",
-        "endpoints": ["/upload-html", "/generate-image", "/process-loom-video", "/health"],
+        "endpoints": ["/upload-html", "/generate-image", "/process-loom-video", "/upload-linkedin-video", "/health"],
         "aws_configured": bool(AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY and S3_BUCKET_NAME),
         "timestamp": datetime.now().isoformat()
     }
@@ -474,6 +480,289 @@ async def process_loom_video(request: LoomVideoRequest):
         raise HTTPException(
             status_code=500,
             detail=f"Failed to process loom video: {str(e)}"
+        )
+
+@app.post("/upload-linkedin-video")
+async def upload_linkedin_video(
+    request: LinkedInVideoRequest,
+    authorization: str = Header(...)
+):
+    """
+    Upload a video to LinkedIn and create a UGC post with caption using LinkedIn v2 API.
+
+    Video Requirements:
+    - Format: MP4
+    - Duration: 3 seconds to 30 minutes
+    - Size: 75 KB to 500 MB
+
+    The LinkedIn access token must have the following permissions:
+    - r_liteprofile: Read basic profile information
+    - w_member_social: Write posts and content
+
+    Uses LinkedIn v2 API endpoints in a 3-step process:
+    - POST /v2/assets?action=registerUpload (initialize upload)
+    - PUT to upload URL (upload video file)
+    - POST /v2/ugcPosts (create UGC post)
+
+    Args:
+        request: LinkedInVideoRequest containing video_url, caption, and optional visibility/filename
+        authorization: Bearer token for LinkedIn API access (should be "Bearer <token>")
+
+    Returns:
+        JSON response with upload status and post details
+    """
+    logger.info(f"LinkedIn video upload request received - Video URL: {request.video_url}")
+
+    try:
+        # Validate authorization header
+        if not authorization or not authorization.lower().startswith("bearer "):
+            logger.error("Missing or invalid authorization header")
+            raise HTTPException(
+                status_code=401,
+                detail="Authorization header with Bearer token is required"
+            )
+
+        # Extract access token
+        access_token = authorization.split(" ", 1)[1].strip()
+
+        # Validate visibility setting
+        valid_visibilities = ["PUBLIC", "CONNECTIONS", "LOGGED_IN"]
+        if request.visibility.upper() not in valid_visibilities:
+            logger.error(f"Invalid visibility setting: {request.visibility}")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid visibility. Must be one of: {', '.join(valid_visibilities)}"
+            )
+
+        # Step 1: Download the video from the provided URL
+        logger.info(f"Downloading video from: {request.video_url}")
+        video_response = requests.get(request.video_url, timeout=300)  # 5 minute timeout for large videos
+        video_response.raise_for_status()
+
+        video_content = video_response.content
+        content_length = len(video_content)
+
+        # Validate video specifications per LinkedIn requirements
+        min_size_kb = 75 * 1024  # 75 KB
+        max_size_mb = 500 * 1024 * 1024  # 500 MB
+
+        if content_length < min_size_kb:
+            logger.error(f"Video too small: {content_length} bytes. Minimum: {min_size_kb} bytes (75 KB)")
+            raise HTTPException(
+                status_code=400,
+                detail="Video file is too small. LinkedIn requires minimum 75 KB"
+            )
+
+        if content_length > max_size_mb:
+            logger.error(f"Video too large: {content_length} bytes. Maximum: {max_size_mb} bytes (500 MB)")
+            raise HTTPException(
+                status_code=400,
+                detail="Video file is too large. LinkedIn allows maximum 500 MB"
+            )
+
+        logger.info(f"Video downloaded successfully. Size: {content_length} bytes ({content_length / (1024*1024):.2f} MB)")
+
+        # Generate filename if not provided
+        filename = request.filename
+        if not filename:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            unique_id = str(uuid.uuid4())[:8]
+            filename = f"linkedin_video_{timestamp}_{unique_id}.mp4"
+        elif not filename.endswith('.mp4'):
+            filename += '.mp4'
+
+        # Step 2: Get user's member ID from LinkedIn
+        logger.info("Getting user member ID from LinkedIn API")
+
+        linkedin_headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+            "X-Restli-Protocol-Version": "2.0.0",
+            "LinkedIn-Version": "202409"  # Required for LinkedIn REST API
+        }
+
+        # Get the authenticated user's info to get their member ID
+        profile_url = "https://api.linkedin.com/v2/userinfo"
+        profile_response = requests.get(
+            profile_url,
+            headers=linkedin_headers,
+            timeout=30
+        )
+
+        if profile_response.status_code != 200:
+            logger.error(f"Failed to get LinkedIn userinfo: {profile_response.status_code} - {profile_response.text}")
+            raise HTTPException(
+                status_code=profile_response.status_code,
+                detail=f"Failed to get LinkedIn user information: {profile_response.text}"
+            )
+
+        profile_data = profile_response.json()
+        member_id = profile_data.get("sub")
+
+        if not member_id:
+            logger.error(f"Could not extract member ID from userinfo response: {profile_data}")
+            raise HTTPException(
+                status_code=500,
+                detail="Could not extract member ID from LinkedIn userinfo"
+            )
+
+        logger.info(f"Retrieved member ID: {member_id}")
+
+        # Step 3: Initialize the Upload with LinkedIn v2 API
+        logger.info("Initializing video upload with LinkedIn v2 API")
+
+        register_payload = {
+            "registerUploadRequest": {
+                "recipes": [
+                    "urn:li:digitalmediaRecipe:feedshare-video"
+                ],
+                "owner": f"urn:li:person:{member_id}",
+                "serviceRelationships": [
+                    {
+                        "relationshipType": "OWNER",
+                        "identifier": "urn:li:userGeneratedContent"
+                    }
+                ]
+            }
+        }
+
+        register_url = "https://api.linkedin.com/v2/assets?action=registerUpload"
+        register_response = requests.post(
+            register_url,
+            headers=linkedin_headers,
+            json=register_payload,
+            timeout=30
+        )
+
+        if register_response.status_code != 200:
+            logger.error(f"LinkedIn video registration failed: {register_response.status_code} - {register_response.text}")
+            raise HTTPException(
+                status_code=register_response.status_code,
+                detail=f"Failed to register video upload: {register_response.text}"
+            )
+
+        register_data = register_response.json()
+
+        # Extract asset URN and upload URL from v2 API response
+        asset_urn = register_data.get("value", {}).get("asset")
+
+        upload_mechanism = register_data.get("value", {}).get("uploadMechanism", {})
+        upload_url = upload_mechanism.get("com.linkedin.digitalmedia.uploading.MediaUploadHttpRequest", {}).get("uploadUrl")
+
+        if not asset_urn or not upload_url:
+            logger.error(f"Invalid response from LinkedIn v2 API registration: {register_data}")
+            raise HTTPException(
+                status_code=500,
+                detail="Invalid response from LinkedIn v2 API during registration"
+            )
+
+        logger.info(f"Video registered successfully. Asset URN: {asset_urn}")
+
+        # Step 4: Upload the Video File
+        logger.info(f"Uploading video to LinkedIn upload URL: {upload_url}")
+
+        # Note: Do NOT include Authorization header in this PUT request
+        upload_headers = {
+            "Content-Type": "video/mp4"
+        }
+
+        upload_response = requests.put(
+            upload_url,
+            headers=upload_headers,
+            data=video_content,
+            timeout=600  # 10 minute timeout for upload
+        )
+
+        if upload_response.status_code not in [200, 201]:
+            logger.error(f"LinkedIn video upload failed: {upload_response.status_code} - {upload_response.text}")
+            raise HTTPException(
+                status_code=upload_response.status_code,
+                detail=f"Failed to upload video: {upload_response.text}"
+            )
+
+        logger.info("Video uploaded successfully to LinkedIn")
+
+        # Step 5: Create the Post (UGC Post)
+        logger.info("Creating LinkedIn UGC post with video")
+
+        post_payload = {
+            "author": f"urn:li:person:{member_id}",
+            "lifecycleState": "PUBLISHED",
+            "specificContent": {
+                "com.linkedin.ugc.ShareContent": {
+                    "shareCommentary": {
+                        "text": request.caption
+                    },
+                    "shareMediaCategory": "VIDEO",
+                    "media": [
+                        {
+                            "status": "READY",
+                            "description": {
+                                "text": "Video uploaded via API"
+                            },
+                            "media": asset_urn,
+                            "title": {
+                                "text": filename or "Uploaded Video"
+                            }
+                        }
+                    ]
+                }
+            },
+            "visibility": {
+                "com.linkedin.ugc.MemberNetworkVisibility": request.visibility.upper()
+            }
+        }
+
+        post_url = "https://api.linkedin.com/v2/ugcPosts"
+        post_response = requests.post(
+            post_url,
+            headers=linkedin_headers,
+            json=post_payload,
+            timeout=30
+        )
+
+        if post_response.status_code not in [200, 201]:
+            logger.error(f"LinkedIn UGC post creation failed: {post_response.status_code} - {post_response.text}")
+            raise HTTPException(
+                status_code=post_response.status_code,
+                detail=f"Failed to create UGC post: {post_response.text}"
+            )
+
+        post_data = post_response.json()
+        post_urn = post_data.get("id")
+
+        if not post_urn:
+            logger.warning(f"No post ID in UGC Posts API response: {post_data}")
+            post_urn = post_data.get("urn") or f"urn:li:share:{post_data.get('id', 'unknown')}"
+
+        logger.info(f"LinkedIn UGC post created successfully. Post URN: {post_urn}")
+
+        # Return success response
+        response_data = {
+            "success": True,
+            "message": "Video uploaded and posted to LinkedIn successfully",
+            "asset_urn": asset_urn,
+            "post_urn": post_urn,
+            "caption": request.caption,
+            "visibility": request.visibility,
+            "filename": filename,
+            "uploaded_at": datetime.now().isoformat()
+        }
+
+        logger.info("LinkedIn video upload completed successfully")
+        return JSONResponse(status_code=200, content=response_data)
+
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Request error during LinkedIn API call: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to connect to LinkedIn API: {str(e)}"
+        )
+    except Exception as e:
+        logger.error(f"Error during LinkedIn video upload: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to upload video to LinkedIn: {str(e)}"
         )
 
 @app.get("/health")
