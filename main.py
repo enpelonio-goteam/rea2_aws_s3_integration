@@ -700,10 +700,7 @@ async def upload_linkedin_video(
                             "description": {
                                 "text": "Video uploaded via API"
                             },
-                            "media": asset_urn,
-                            "title": {
-                                "text": filename or "Uploaded Video"
-                            }
+                            "media": asset_urn
                         }
                     ]
                 }
