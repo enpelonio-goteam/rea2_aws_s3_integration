@@ -51,6 +51,18 @@ class LinkedInVideoRequest(BaseModel):
     visibility: Optional[str] = "PUBLIC"  # PUBLIC, CONNECTIONS, or LOGGED_IN
     filename: Optional[str] = None
 
+class HTMLToImageRequest(BaseModel):
+    html_content: str
+    width: Optional[int] = 1080  # Default Instagram post width
+    height: Optional[int] = 1080  # Default Instagram post height (square)
+    filename: Optional[str] = None
+    quality: Optional[int] = 95  # PNG quality (0-100)
+
+class UrlToGoogleDriveRequest(BaseModel):
+    file_url: str  # Publicly accessible URL to download from
+    folder_id: str  # Google Drive folder ID to upload to
+    filename: Optional[str] = None  # Optional filename for the uploaded file
+
 app = FastAPI(title="Logic Provider Functions", version="1.0.0")
 
 # AWS S3 configuration
@@ -97,7 +109,7 @@ async def root():
     return {
         "message": "Logic Provider Functions API", 
         "status": "running",
-        "endpoints": ["/upload-html", "/generate-image", "/process-loom-video", "/upload-linkedin-video", "/health"],
+        "endpoints": ["/upload-html", "/generate-image", "/html-to-image", "/process-loom-video", "/upload-linkedin-video", "/url-to-google-drive", "/health"],
         "aws_configured": bool(AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY and S3_BUCKET_NAME),
         "timestamp": datetime.now().isoformat()
     }
@@ -482,6 +494,182 @@ async def process_loom_video(request: LoomVideoRequest):
             detail=f"Failed to process loom video: {str(e)}"
         )
 
+@app.post("/html-to-image")
+async def html_to_image(request: HTMLToImageRequest):
+    """
+    Convert HTML content to a PNG image optimized for Instagram posting.
+    Uses Playwright to render HTML in a headless browser and capture as PNG.
+    
+    Instagram Recommended Dimensions:
+    - Square Post: 1080x1080px (default)
+    - Portrait Post: 1080x1350px
+    - Landscape Post: 1080x566px
+    - Story: 1080x1920px
+    
+    Args:
+        request: HTMLToImageRequest containing html_content and optional dimensions/filename
+    
+    Returns:
+        JSON response with the public S3 URL of the generated PNG image
+    """
+    logger.info(f"HTML-to-Image request received - HTML length: {len(request.html_content)}, Dimensions: {request.width}x{request.height}")
+    
+    try:
+        # Validate required AWS environment variables
+        if not all([AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, S3_BUCKET_NAME]):
+            logger.error("Missing required AWS environment variables")
+            raise HTTPException(
+                status_code=500,
+                detail="AWS credentials or bucket name not configured"
+            )
+        
+        # Check if S3 client is available
+        if not s3_client:
+            logger.error("S3 client not initialized")
+            raise HTTPException(
+                status_code=500,
+                detail="S3 client not available - check AWS configuration"
+            )
+        
+        # Validate dimensions for Instagram
+        if request.width < 320 or request.width > 1080:
+            logger.warning(f"Width {request.width}px is outside Instagram's recommended range (320-1080px)")
+        
+        if request.height < 566 or request.height > 1920:
+            logger.warning(f"Height {request.height}px is outside Instagram's recommended range (566-1920px)")
+        
+        # Import Playwright
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            logger.error("Playwright not installed")
+            raise HTTPException(
+                status_code=500,
+                detail="Playwright library not installed. Please run: pip install playwright && playwright install chromium"
+            )
+        
+        # Create temporary file for the screenshot
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.png') as temp_file:
+            temp_image_path = temp_file.name
+        
+        try:
+            logger.info("Launching Playwright browser...")
+            
+            # Launch Playwright and render HTML
+            with sync_playwright() as p:
+                # Launch browser - use chromium for best compatibility
+                browser = p.chromium.launch(
+                    headless=True,
+                    args=[
+                        '--no-sandbox',
+                        '--disable-setuid-sandbox',
+                        '--disable-dev-shm-usage',
+                        '--disable-accelerated-2d-canvas',
+                        '--no-first-run',
+                        '--no-zygote',
+                        '--disable-gpu'
+                    ]
+                )
+                
+                logger.info("Browser launched successfully")
+                
+                # Create a new page with specified viewport
+                page = browser.new_page(
+                    viewport={'width': request.width, 'height': request.height},
+                    device_scale_factor=2  # Retina display for higher quality
+                )
+                
+                logger.info(f"Page created with viewport: {request.width}x{request.height}")
+                
+                # Set the HTML content
+                page.set_content(request.html_content, wait_until='networkidle')
+                
+                logger.info("HTML content loaded successfully")
+                
+                # Take screenshot
+                page.screenshot(
+                    path=temp_image_path,
+                    type='png',
+                    full_page=False,  # Only capture viewport
+                    omit_background=False  # Include background
+                )
+                
+                logger.info(f"Screenshot captured: {temp_image_path}")
+                
+                # Close browser
+                browser.close()
+                logger.info("Browser closed")
+            
+            # Generate filename if not provided
+            filename = request.filename
+            if not filename:
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                unique_id = str(uuid.uuid4())[:8]
+                filename = f"instagram-images/ig_post_{timestamp}_{unique_id}.png"
+            else:
+                # Ensure filename has instagram-images/ prefix and .png extension
+                if not filename.startswith("instagram-images/"):
+                    filename = f"instagram-images/{filename}"
+                if not filename.endswith('.png'):
+                    filename += '.png'
+            
+            logger.info(f"Uploading image to S3 - Bucket: {S3_BUCKET_NAME}, Key: {filename}")
+            
+            # Upload to S3
+            with open(temp_image_path, 'rb') as image_file:
+                s3_client.put_object(
+                    Bucket=S3_BUCKET_NAME,
+                    Key=filename,
+                    Body=image_file,
+                    ContentType="image/png",
+                    ACL='public-read',
+                    Metadata={
+                        'width': str(request.width),
+                        'height': str(request.height),
+                        'generated-by': 'html-to-image-api'
+                    }
+                )
+            
+            logger.info(f"Image uploaded to S3 successfully: {filename}")
+            
+            # Generate public URL
+            public_url = f"https://{S3_BUCKET_NAME}.s3.{AWS_REGION}.amazonaws.com/{filename}"
+            logger.info(f"Generated public URL: {public_url}")
+            
+            # Clean up temporary file
+            os.unlink(temp_image_path)
+            
+            # Return response
+            response_data = {
+                "success": True,
+                "message": "HTML converted to image successfully",
+                "public_url": public_url,
+                "filename": filename,
+                "dimensions": {
+                    "width": request.width,
+                    "height": request.height
+                },
+                "instagram_optimized": True,
+                "format": "PNG",
+                "generated_at": datetime.now().isoformat()
+            }
+            
+            logger.info("HTML-to-Image conversion completed successfully")
+            return JSONResponse(status_code=200, content=response_data)
+            
+        except Exception as e:
+            # Clean up temporary file if it exists
+            if os.path.exists(temp_image_path):
+                os.unlink(temp_image_path)
+            raise
+            
+    except Exception as e:
+        logger.error(f"Error during HTML-to-Image conversion: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to convert HTML to image: {str(e)}"
+        )
+
 @app.post("/upload-linkedin-video")
 async def upload_linkedin_video(
     request: LinkedInVideoRequest,
@@ -760,6 +948,208 @@ async def upload_linkedin_video(
         raise HTTPException(
             status_code=500,
             detail=f"Failed to upload video to LinkedIn: {str(e)}"
+        )
+
+@app.post("/url-to-google-drive")
+async def url_to_google_drive(
+    request: UrlToGoogleDriveRequest,
+    authorization: str = Header(...)
+):
+    """
+    Download a file from a publicly accessible URL and upload it to Google Drive.
+    
+    This endpoint acts as a middleman that:
+    1. Downloads the file from the provided URL
+    2. Uploads it to the specified Google Drive folder using the provided credentials
+    
+    Args:
+        request: UrlToGoogleDriveRequest containing file_url, folder_id, and optional filename
+        authorization: Bearer token for Google Drive API access (should be "Bearer <access_token>")
+    
+    Returns:
+        JSON response with upload status and Google Drive file details
+    """
+    logger.info(f"URL to Google Drive request received - URL: {request.file_url}, Folder ID: {request.folder_id}")
+    
+    try:
+        # Validate authorization header
+        if not authorization or not authorization.lower().startswith("bearer "):
+            logger.error("Missing or invalid authorization header")
+            raise HTTPException(
+                status_code=401,
+                detail="Authorization header with Bearer token is required. Format: 'Bearer <google_drive_access_token>'"
+            )
+        
+        # Extract access token
+        access_token = authorization.split(" ", 1)[1].strip()
+        
+        # Step 1: Download the file from the provided URL
+        logger.info(f"Downloading file from: {request.file_url}")
+        
+        try:
+            download_response = requests.get(
+                request.file_url,
+                timeout=300,  # 5 minute timeout for large files
+                stream=True
+            )
+            download_response.raise_for_status()
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to download file from URL: {str(e)}")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Failed to download file from URL: {str(e)}"
+            )
+        
+        file_content = download_response.content
+        content_length = len(file_content)
+        
+        # Try to determine content type from response headers
+        content_type = download_response.headers.get('Content-Type', 'application/octet-stream')
+        # Clean up content type (remove charset and other parameters)
+        if ';' in content_type:
+            content_type = content_type.split(';')[0].strip()
+        
+        logger.info(f"File downloaded successfully. Size: {content_length} bytes ({content_length / (1024*1024):.2f} MB), Content-Type: {content_type}")
+        
+        # Step 2: Determine filename
+        filename = request.filename
+        if not filename:
+            # Try to extract filename from URL or Content-Disposition header
+            content_disposition = download_response.headers.get('Content-Disposition', '')
+            if 'filename=' in content_disposition:
+                import re
+                match = re.search(r'filename[*]?=["\']?([^"\';\s]+)["\']?', content_disposition)
+                if match:
+                    filename = match.group(1)
+            
+            if not filename:
+                # Extract from URL path
+                from urllib.parse import urlparse, unquote
+                parsed_url = urlparse(request.file_url)
+                path_filename = parsed_url.path.split('/')[-1]
+                if path_filename:
+                    filename = unquote(path_filename)
+                else:
+                    # Generate a default filename
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    unique_id = str(uuid.uuid4())[:8]
+                    # Try to determine extension from content type
+                    extension_map = {
+                        'image/jpeg': '.jpg',
+                        'image/png': '.png',
+                        'image/gif': '.gif',
+                        'image/webp': '.webp',
+                        'video/mp4': '.mp4',
+                        'video/webm': '.webm',
+                        'application/pdf': '.pdf',
+                        'text/plain': '.txt',
+                        'text/html': '.html',
+                        'application/json': '.json',
+                    }
+                    extension = extension_map.get(content_type, '')
+                    filename = f"file_{timestamp}_{unique_id}{extension}"
+        
+        logger.info(f"Using filename: {filename}")
+        
+        # Step 3: Upload to Google Drive using the REST API
+        logger.info(f"Uploading file to Google Drive folder: {request.folder_id}")
+        
+        # Google Drive API v3 - multipart upload
+        # First, create metadata
+        metadata = {
+            "name": filename,
+            "parents": [request.folder_id]
+        }
+        
+        # Use multipart upload for simplicity
+        import io
+        from email.mime.multipart import MIMEMultipart
+        from email.mime.base import MIMEBase
+        from email.mime.application import MIMEApplication
+        
+        # Create the multipart request manually
+        boundary = f"----WebKitFormBoundary{uuid.uuid4().hex[:16]}"
+        
+        # Build the multipart body
+        body_parts = []
+        
+        # Part 1: Metadata (JSON)
+        body_parts.append(f'--{boundary}'.encode())
+        body_parts.append(b'Content-Type: application/json; charset=UTF-8')
+        body_parts.append(b'')
+        body_parts.append(json.dumps(metadata).encode())
+        
+        # Part 2: File content
+        body_parts.append(f'--{boundary}'.encode())
+        body_parts.append(f'Content-Type: {content_type}'.encode())
+        body_parts.append(b'')
+        body_parts.append(file_content)
+        
+        # Closing boundary
+        body_parts.append(f'--{boundary}--'.encode())
+        
+        # Join with CRLF
+        body = b'\r\n'.join(body_parts)
+        
+        # Make the upload request
+        upload_url = "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart"
+        
+        upload_headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": f"multipart/related; boundary={boundary}"
+        }
+        
+        upload_response = requests.post(
+            upload_url,
+            headers=upload_headers,
+            data=body,
+            timeout=600  # 10 minute timeout for large uploads
+        )
+        
+        if upload_response.status_code not in [200, 201]:
+            logger.error(f"Google Drive upload failed: {upload_response.status_code} - {upload_response.text}")
+            raise HTTPException(
+                status_code=upload_response.status_code,
+                detail=f"Failed to upload to Google Drive: {upload_response.text}"
+            )
+        
+        drive_response = upload_response.json()
+        file_id = drive_response.get("id")
+        file_name = drive_response.get("name")
+        
+        logger.info(f"File uploaded to Google Drive successfully. File ID: {file_id}")
+        
+        # Generate Google Drive file URL
+        drive_file_url = f"https://drive.google.com/file/d/{file_id}/view"
+        
+        # Return success response
+        response_data = {
+            "success": True,
+            "message": "File downloaded and uploaded to Google Drive successfully",
+            "file_id": file_id,
+            "file_name": file_name,
+            "drive_url": drive_file_url,
+            "folder_id": request.folder_id,
+            "source_url": request.file_url,
+            "file_size_bytes": content_length,
+            "content_type": content_type,
+            "uploaded_at": datetime.now().isoformat()
+        }
+        
+        logger.info("URL to Google Drive transfer completed successfully")
+        return JSONResponse(status_code=200, content=response_data)
+    
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Request error during Google Drive API call: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to connect to Google Drive API: {str(e)}"
+        )
+    except Exception as e:
+        logger.error(f"Error during URL to Google Drive transfer: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to transfer file to Google Drive: {str(e)}"
         )
 
 @app.get("/health")
