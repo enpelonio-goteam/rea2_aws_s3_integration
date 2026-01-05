@@ -69,6 +69,25 @@ class ElevenLabsSpeechRequest(BaseModel):
     model_id: Optional[str] = "eleven_monolingual_v1"  # Model ID (optional)
     filename: Optional[str] = None  # Optional filename for the uploaded audio
 
+class HeyGenAvatarIVRequest(BaseModel):
+    """
+    Request model for HeyGen Avatar IV video generation.
+    Based on: https://docs.heygen.com/reference/create-avatar-iv-video
+    
+    Note: Instead of image_key, this endpoint accepts image_url which will be 
+    automatically uploaded to HeyGen using their Upload Asset API.
+    """
+    image_url: str  # Publicly accessible URL of the image to use for avatar (will be uploaded to HeyGen)
+    script: str  # The text that the avatar will speak (required)
+    voice_id: str  # The voice ID to use for speech generation (required)
+    video_title: Optional[str] = None  # Optional title for the video
+    video_orientation: Optional[str] = None  # Video orientation (e.g., "landscape", "portrait", "square")
+    fit: Optional[str] = None  # How the image fits in the video frame: "cover" or "contain"
+    custom_motion_prompt: Optional[str] = None  # Custom motion prompt for avatar movements
+    enhance_custom_motion_prompt: Optional[bool] = None  # Whether to enhance the custom motion prompt with AI
+    audio_url: Optional[str] = None  # URL of an audio file to use instead of TTS
+    audio_asset_id: Optional[str] = None  # Asset ID of a previously uploaded audio file
+
 app = FastAPI(title="Logic Provider Functions", version="1.0.0")
 
 # AWS S3 configuration
@@ -115,7 +134,7 @@ async def root():
     return {
         "message": "Logic Provider Functions API", 
         "status": "running",
-        "endpoints": ["/upload-html", "/generate-image", "/html-to-image", "/process-loom-video", "/upload-linkedin-video", "/url-to-google-drive", "/health"],
+        "endpoints": ["/upload-html", "/generate-image", "/html-to-image", "/process-loom-video", "/upload-linkedin-video", "/url-to-google-drive", "/eleven-labs-speech", "/heygen-avatar-iv", "/health"],
         "aws_configured": bool(AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY and S3_BUCKET_NAME),
         "timestamp": datetime.now().isoformat()
     }
@@ -1303,6 +1322,198 @@ async def eleven_labs_speech(
         raise HTTPException(
             status_code=500,
             detail=f"Failed to generate speech: {str(e)}"
+        )
+
+@app.post("/heygen-avatar-iv")
+async def heygen_avatar_iv(
+    request: HeyGenAvatarIVRequest,
+    x_api_key: str = Header(..., alias="X-Api-Key")
+):
+    """
+    Generate an Avatar IV video using HeyGen's API.
+    
+    This endpoint:
+    1. Takes a publicly accessible image URL
+    2. Uploads the image to HeyGen using their Upload Asset API
+    3. Uses the uploaded image to generate an Avatar IV video
+    4. Returns the response from HeyGen
+    
+    HeyGen API Documentation:
+    - Upload Asset: https://docs.heygen.com/reference/upload-asset
+    - Create Avatar IV Video: https://docs.heygen.com/reference/create-avatar-iv-video
+    
+    Args:
+        request: HeyGenAvatarIVRequest containing:
+            - image_url: Publicly accessible URL of the image (required)
+            - script: Text for the avatar to speak (required)
+            - voice_id: Voice ID to use (required)
+            - video_title: Optional title for the video
+            - video_orientation: Optional video orientation
+            - fit: Optional fit mode ("cover" or "contain")
+            - custom_motion_prompt: Optional custom motion prompt
+            - enhance_custom_motion_prompt: Optional boolean to enhance motion prompt
+            - audio_url: Optional URL of audio file to use instead of TTS
+            - audio_asset_id: Optional asset ID of uploaded audio
+        x_api_key: HeyGen API key passed via X-Api-Key header
+    
+    Returns:
+        JSON response from HeyGen's Create Avatar IV Video API
+    """
+    logger.info(f"HeyGen Avatar IV request received - Image URL: {request.image_url}, Script length: {len(request.script)}")
+    
+    try:
+        # Step 1: Download the image from the provided URL
+        logger.info(f"Downloading image from: {request.image_url}")
+        
+        try:
+            image_response = requests.get(
+                request.image_url,
+                timeout=60,  # 1 minute timeout for image download
+                stream=True
+            )
+            image_response.raise_for_status()
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to download image from URL: {str(e)}")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Failed to download image from URL: {str(e)}"
+            )
+        
+        image_content = image_response.content
+        content_length = len(image_content)
+        
+        # Determine content type from response headers
+        content_type = image_response.headers.get('Content-Type', 'image/jpeg')
+        if ';' in content_type:
+            content_type = content_type.split(';')[0].strip()
+        
+        # Determine file extension based on content type
+        extension_map = {
+            'image/jpeg': '.jpg',
+            'image/png': '.png',
+            'image/gif': '.gif',
+            'image/webp': '.webp',
+        }
+        extension = extension_map.get(content_type, '.jpg')
+        
+        logger.info(f"Image downloaded successfully. Size: {content_length} bytes, Content-Type: {content_type}")
+        
+        # Step 2: Upload the image to HeyGen
+        logger.info("Uploading image to HeyGen...")
+        
+        upload_url = "https://upload.heygen.com/v1/asset"
+        upload_headers = {
+            "X-Api-Key": x_api_key
+        }
+        
+        # Upload as multipart form data
+        files = {
+            "file": (f"avatar_image{extension}", image_content, content_type)
+        }
+        
+        upload_response = requests.post(
+            upload_url,
+            headers=upload_headers,
+            files=files,
+            timeout=120  # 2 minute timeout for upload
+        )
+        
+        if upload_response.status_code != 200:
+            logger.error(f"HeyGen asset upload failed: {upload_response.status_code} - {upload_response.text}")
+            raise HTTPException(
+                status_code=upload_response.status_code,
+                detail=f"Failed to upload image to HeyGen: {upload_response.text}"
+            )
+        
+        upload_data = upload_response.json()
+        logger.info(f"HeyGen upload response: {upload_data}")
+        
+        # Extract the image key from the response
+        # HeyGen returns the asset_id in data.image_key or data.asset_id or data.url
+        image_key = None
+        if "data" in upload_data:
+            image_key = upload_data["data"].get("image_key") or upload_data["data"].get("asset_id") or upload_data["data"].get("url")
+        elif "image_key" in upload_data:
+            image_key = upload_data["image_key"]
+        elif "asset_id" in upload_data:
+            image_key = upload_data["asset_id"]
+        
+        if not image_key:
+            logger.error(f"Could not extract image_key from HeyGen upload response: {upload_data}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Could not extract image_key from HeyGen upload response: {upload_data}"
+            )
+        
+        logger.info(f"Image uploaded to HeyGen successfully. Image key: {image_key}")
+        
+        # Step 3: Generate the Avatar IV video
+        logger.info("Generating Avatar IV video...")
+        
+        generate_url = "https://api.heygen.com/v2/video/av4/generate"
+        generate_headers = {
+            "X-Api-Key": x_api_key,
+            "Content-Type": "application/json"
+        }
+        
+        # Build the request payload with required parameters
+        generate_payload = {
+            "image_key": image_key,
+            "script": request.script,
+            "voice_id": request.voice_id
+        }
+        
+        # Add optional parameters if provided
+        if request.video_title is not None:
+            generate_payload["video_title"] = request.video_title
+        if request.video_orientation is not None:
+            generate_payload["video_orientation"] = request.video_orientation
+        if request.fit is not None:
+            generate_payload["fit"] = request.fit
+        if request.custom_motion_prompt is not None:
+            generate_payload["custom_motion_prompt"] = request.custom_motion_prompt
+        if request.enhance_custom_motion_prompt is not None:
+            generate_payload["enhance_custom_motion_prompt"] = request.enhance_custom_motion_prompt
+        if request.audio_url is not None:
+            generate_payload["audio_url"] = request.audio_url
+        if request.audio_asset_id is not None:
+            generate_payload["audio_asset_id"] = request.audio_asset_id
+        
+        logger.info(f"Calling HeyGen Avatar IV API with payload: {generate_payload}")
+        
+        generate_response = requests.post(
+            generate_url,
+            headers=generate_headers,
+            json=generate_payload,
+            timeout=120  # 2 minute timeout for API call
+        )
+        
+        if generate_response.status_code != 200:
+            logger.error(f"HeyGen Avatar IV generation failed: {generate_response.status_code} - {generate_response.text}")
+            raise HTTPException(
+                status_code=generate_response.status_code,
+                detail=f"Failed to generate Avatar IV video: {generate_response.text}"
+            )
+        
+        heygen_response = generate_response.json()
+        logger.info(f"HeyGen Avatar IV video generation initiated successfully: {heygen_response}")
+        
+        # Return the HeyGen response directly
+        return JSONResponse(status_code=200, content=heygen_response)
+    
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Request error during HeyGen API call: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to connect to HeyGen API: {str(e)}"
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error during HeyGen Avatar IV generation: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to generate Avatar IV video: {str(e)}"
         )
 
 @app.get("/health")
