@@ -76,10 +76,14 @@ class HeyGenAvatarIVRequest(BaseModel):
     
     Note: Instead of image_key, this endpoint accepts image_url which will be 
     automatically uploaded to HeyGen using their Upload Asset API.
+    
+    You can either:
+    1. Use TTS (text-to-speech): Provide script and voice_id
+    2. Use pre-recorded audio: Provide audio_url or audio_asset_id (script and voice_id not required)
     """
     image_url: str  # Publicly accessible URL of the image to use for avatar (will be uploaded to HeyGen)
-    script: str  # The text that the avatar will speak (required)
-    voice_id: str  # The voice ID to use for speech generation (required)
+    script: Optional[str] = None  # The text that the avatar will speak (required for TTS, optional if using audio_url)
+    voice_id: Optional[str] = None  # The voice ID to use for speech generation (required for TTS, optional if using audio_url)
     video_title: Optional[str] = None  # Optional title for the video
     video_orientation: Optional[str] = None  # Video orientation (e.g., "landscape", "portrait", "square")
     fit: Optional[str] = None  # How the image fits in the video frame: "cover" or "contain"
@@ -1359,7 +1363,7 @@ async def heygen_avatar_iv(
     Returns:
         JSON response from HeyGen's Create Avatar IV Video API
     """
-    logger.info(f"HeyGen Avatar IV request received - Image URL: {request.image_url}, Script length: {len(request.script)}")
+    logger.info(f"HeyGen Avatar IV request received - Image URL: {request.image_url}, Script: {'Yes' if request.script else 'No'}, Audio URL: {'Yes' if request.audio_url else 'No'}")
     
     try:
         # Step 1: Download the image from the provided URL
@@ -1456,12 +1460,16 @@ async def heygen_avatar_iv(
             "Content-Type": "application/json"
         }
         
-        # Build the request payload with required parameters
+        # Build the request payload with image_key (required)
         generate_payload = {
-            "image_key": image_key,
-            "script": request.script,
-            "voice_id": request.voice_id
+            "image_key": image_key
         }
+        
+        # Add TTS parameters if provided (script and voice_id)
+        if request.script is not None:
+            generate_payload["script"] = request.script
+        if request.voice_id is not None:
+            generate_payload["voice_id"] = request.voice_id
         
         # Add optional parameters if provided
         if request.video_title is not None:
