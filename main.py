@@ -1367,11 +1367,16 @@ async def heygen_avatar_iv(
     
     try:
         # Step 1: Download the image from the provided URL
-        logger.info(f"Downloading image from: {request.image_url}")
+        logger.info(f"Downloading image from URL: {request.image_url}")
         
         try:
+            # Use a proper User-Agent header and handle URL encoding
+            download_headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            }
             image_response = requests.get(
                 request.image_url,
+                headers=download_headers,
                 timeout=60,  # 1 minute timeout for image download
                 stream=True
             )
@@ -1386,41 +1391,49 @@ async def heygen_avatar_iv(
         image_content = image_response.content
         content_length = len(image_content)
         
+        if content_length == 0:
+            logger.error("Downloaded image is empty")
+            raise HTTPException(
+                status_code=400,
+                detail="Downloaded image is empty. Please check the image URL."
+            )
+        
         # Determine content type from response headers
-        content_type = image_response.headers.get('Content-Type', 'image/jpeg')
+        content_type = image_response.headers.get('Content-Type', 'image/png')
         if ';' in content_type:
             content_type = content_type.split(';')[0].strip()
         
         # Determine file extension based on content type
         extension_map = {
             'image/jpeg': '.jpg',
+            'image/jpg': '.jpg',
             'image/png': '.png',
             'image/gif': '.gif',
             'image/webp': '.webp',
         }
-        extension = extension_map.get(content_type, '.jpg')
+        extension = extension_map.get(content_type, '.png')
         
         logger.info(f"Image downloaded successfully. Size: {content_length} bytes, Content-Type: {content_type}")
         
-        # Step 2: Upload the image to HeyGen
+        # Step 2: Upload the image to HeyGen as raw binary data
         logger.info("Uploading image to HeyGen...")
         
         upload_url = "https://upload.heygen.com/v1/asset"
         upload_headers = {
-            "X-Api-Key": x_api_key
+            "X-Api-Key": x_api_key,
+            "Content-Type": content_type  # Set content type to actual image type (e.g., image/png)
         }
         
-        # Upload as multipart form data
-        files = {
-            "file": (f"avatar_image{extension}", image_content, content_type)
-        }
-        
+        # Upload as raw binary data (not multipart form-data)
         upload_response = requests.post(
             upload_url,
             headers=upload_headers,
-            files=files,
+            data=image_content,  # Raw binary data
             timeout=120  # 2 minute timeout for upload
         )
+        
+        logger.info(f"HeyGen upload response status: {upload_response.status_code}")
+        logger.info(f"HeyGen upload response body: {upload_response.text}")
         
         if upload_response.status_code != 200:
             logger.error(f"HeyGen asset upload failed: {upload_response.status_code} - {upload_response.text}")
@@ -1430,7 +1443,7 @@ async def heygen_avatar_iv(
             )
         
         upload_data = upload_response.json()
-        logger.info(f"HeyGen upload response: {upload_data}")
+        logger.info(f"HeyGen upload response parsed: {upload_data}")
         
         # Extract the image key from the response
         # HeyGen returns the asset_id in data.image_key or data.asset_id or data.url
