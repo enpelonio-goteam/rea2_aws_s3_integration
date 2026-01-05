@@ -63,6 +63,12 @@ class UrlToGoogleDriveRequest(BaseModel):
     folder_id: str  # Google Drive folder ID to upload to
     filename: Optional[str] = None  # Optional filename for the uploaded file
 
+class ElevenLabsSpeechRequest(BaseModel):
+    voice_id: str  # Eleven Labs voice ID to use for speech generation
+    text: str  # Text to convert to speech
+    model_id: Optional[str] = "eleven_monolingual_v1"  # Model ID (optional)
+    filename: Optional[str] = None  # Optional filename for the uploaded audio
+
 app = FastAPI(title="Logic Provider Functions", version="1.0.0")
 
 # AWS S3 configuration
@@ -1150,6 +1156,153 @@ async def url_to_google_drive(
         raise HTTPException(
             status_code=500,
             detail=f"Failed to transfer file to Google Drive: {str(e)}"
+        )
+
+@app.post("/eleven-labs-speech")
+async def eleven_labs_speech(
+    request: ElevenLabsSpeechRequest,
+    xi_api_key: str = Header(..., alias="xi-api-key")
+):
+    """
+    Generate speech using Eleven Labs Text-to-Speech API and upload to S3.
+    
+    This endpoint:
+    1. Takes the xi-api-key from request headers
+    2. Calls Eleven Labs API to generate speech from text
+    3. Uploads the returned audio file to S3 under the audio/ folder
+    4. Returns the public URL of the audio file
+    
+    Args:
+        request: ElevenLabsSpeechRequest containing voice_id, text, optional model_id and filename
+        xi_api_key: Eleven Labs API key passed via xi-api-key header
+    
+    Returns:
+        JSON response with the public S3 URL of the generated audio file
+    """
+    logger.info(f"Eleven Labs speech request received - Voice ID: {request.voice_id}, Text length: {len(request.text)}")
+    
+    try:
+        # Validate required AWS environment variables
+        if not all([AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, S3_BUCKET_NAME]):
+            logger.error("Missing required AWS environment variables")
+            raise HTTPException(
+                status_code=500,
+                detail="AWS credentials or bucket name not configured"
+            )
+        
+        # Check if S3 client is available
+        if not s3_client:
+            logger.error("S3 client not initialized")
+            raise HTTPException(
+                status_code=500,
+                detail="S3 client not available - check AWS configuration"
+            )
+        
+        # Validate text is not empty
+        if not request.text.strip():
+            logger.error("Empty text provided")
+            raise HTTPException(
+                status_code=400,
+                detail="Text cannot be empty"
+            )
+        
+        # Prepare Eleven Labs API request
+        eleven_labs_url = f"https://api.elevenlabs.io/v1/text-to-speech/{request.voice_id}"
+        eleven_labs_headers = {
+            "xi-api-key": xi_api_key,
+            "Content-Type": "application/json",
+            "Accept": "audio/mpeg"
+        }
+        
+        eleven_labs_payload = {
+            "text": request.text,
+            "model_id": request.model_id,
+            "voice_settings": {
+                "stability": 0.5,
+                "similarity_boost": 0.75
+            }
+        }
+        
+        logger.info(f"Making request to Eleven Labs API for voice: {request.voice_id}")
+        
+        # Make request to Eleven Labs API
+        response = requests.post(
+            eleven_labs_url,
+            headers=eleven_labs_headers,
+            json=eleven_labs_payload,
+            timeout=120  # 2 minute timeout for speech generation
+        )
+        
+        if response.status_code != 200:
+            logger.error(f"Eleven Labs API error: {response.status_code} - {response.text}")
+            raise HTTPException(
+                status_code=response.status_code,
+                detail=f"Eleven Labs API error: {response.text}"
+            )
+        
+        # Get the audio content
+        audio_content = response.content
+        content_length = len(audio_content)
+        
+        logger.info(f"Audio generated successfully. Size: {content_length} bytes ({content_length / 1024:.2f} KB)")
+        
+        # Generate filename if not provided
+        filename = request.filename
+        if not filename:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            unique_id = str(uuid.uuid4())[:8]
+            filename = f"audio/speech_{timestamp}_{unique_id}.mp3"
+        else:
+            # Ensure filename has audio/ prefix and .mp3 extension
+            if not filename.startswith("audio/"):
+                filename = f"audio/{filename}"
+            if not filename.endswith('.mp3'):
+                filename += '.mp3'
+        
+        logger.info(f"Uploading audio to S3 - Bucket: {S3_BUCKET_NAME}, Key: {filename}")
+        
+        # Upload to S3
+        s3_client.put_object(
+            Bucket=S3_BUCKET_NAME,
+            Key=filename,
+            Body=audio_content,
+            ContentType="audio/mpeg",
+            ACL='public-read'
+        )
+        
+        logger.info(f"Audio uploaded to S3 successfully: {filename}")
+        
+        # Generate public URL
+        public_url = f"https://{S3_BUCKET_NAME}.s3.{AWS_REGION}.amazonaws.com/{filename}"
+        logger.info(f"Generated public URL: {public_url}")
+        
+        # Return success response
+        response_data = {
+            "success": True,
+            "message": "Speech generated and uploaded successfully",
+            "public_url": public_url,
+            "filename": filename,
+            "voice_id": request.voice_id,
+            "model_id": request.model_id,
+            "text_length": len(request.text),
+            "audio_size_bytes": content_length,
+            "generated_at": datetime.now().isoformat()
+        }
+        
+        logger.info("Eleven Labs speech generation completed successfully")
+        return JSONResponse(status_code=200, content=response_data)
+    
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Request error during Eleven Labs API call: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to connect to Eleven Labs API: {str(e)}"
+        )
+    except Exception as e:
+        logger.error(f"Error during speech generation: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to generate speech: {str(e)}"
         )
 
 @app.get("/health")
