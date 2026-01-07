@@ -64,10 +64,20 @@ class UrlToGoogleDriveRequest(BaseModel):
     filename: Optional[str] = None  # Optional filename for the uploaded file
 
 class ElevenLabsSpeechRequest(BaseModel):
+    """
+    Request model for Eleven Labs text-to-speech generation.
+    Based on: https://elevenlabs.io/docs/api-reference/text-to-speech/convert
+    """
     voice_id: str  # Eleven Labs voice ID to use for speech generation
     text: str  # Text to convert to speech
-    model_id: Optional[str] = "eleven_monolingual_v1"  # Model ID (optional)
+    model_id: Optional[str] = "eleven_multilingual_v2"  # Model ID (default: eleven_multilingual_v2)
     filename: Optional[str] = None  # Optional filename for the uploaded audio
+    # Voice settings (all optional - uses Eleven Labs defaults if not provided)
+    stability: Optional[float] = None  # 0.0-1.0, default 0.5. Lower = more emotional range, higher = more stable/monotonous
+    similarity_boost: Optional[float] = None  # 0.0-1.0, default 0.75. How closely AI adheres to original voice
+    style: Optional[float] = None  # 0.0-1.0, default 0. Style exaggeration (higher = more computational resources)
+    use_speaker_boost: Optional[bool] = None  # default true. Boosts similarity to original speaker (increases latency)
+    speed: Optional[float] = None  # default 1.0. Speech speed (<1.0 slower, >1.0 faster)
 
 class HeyGenAvatarIVRequest(BaseModel):
     """
@@ -1237,16 +1247,34 @@ async def eleven_labs_speech(
             "Accept": "audio/mpeg"
         }
         
+        # Build voice_settings object with provided values or defaults
+        voice_settings = {}
+        
+        # Stability: 0.0-1.0, default 0.5
+        voice_settings["stability"] = request.stability if request.stability is not None else 0.5
+        
+        # Similarity boost: 0.0-1.0, default 0.75
+        voice_settings["similarity_boost"] = request.similarity_boost if request.similarity_boost is not None else 0.75
+        
+        # Style: 0.0-1.0, default 0 (only add if provided since it increases latency)
+        if request.style is not None:
+            voice_settings["style"] = request.style
+        
+        # Use speaker boost: default true (only add if explicitly set)
+        if request.use_speaker_boost is not None:
+            voice_settings["use_speaker_boost"] = request.use_speaker_boost
+        
+        # Speed: default 1.0 (only add if provided)
+        if request.speed is not None:
+            voice_settings["speed"] = request.speed
+        
         eleven_labs_payload = {
             "text": request.text,
             "model_id": request.model_id,
-            "voice_settings": {
-                "stability": 0.5,
-                "similarity_boost": 0.75
-            }
+            "voice_settings": voice_settings
         }
         
-        logger.info(f"Making request to Eleven Labs API for voice: {request.voice_id}")
+        logger.info(f"Making request to Eleven Labs API for voice: {request.voice_id}, voice_settings: {voice_settings}")
         
         # Make request to Eleven Labs API
         response = requests.post(
@@ -1307,6 +1335,7 @@ async def eleven_labs_speech(
             "filename": filename,
             "voice_id": request.voice_id,
             "model_id": request.model_id,
+            "voice_settings": voice_settings,
             "text_length": len(request.text),
             "audio_size_bytes": content_length,
             "generated_at": datetime.now().isoformat()
