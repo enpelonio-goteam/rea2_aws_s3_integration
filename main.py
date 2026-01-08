@@ -1073,14 +1073,12 @@ async def url_to_google_drive(
             # Try to extract filename from URL or Content-Disposition header
             content_disposition = download_response.headers.get('Content-Disposition', '')
             if 'filename=' in content_disposition:
-                import re
                 match = re.search(r'filename[*]?=["\']?([^"\';\s]+)["\']?', content_disposition)
                 if match:
                     filename = match.group(1)
             
             if not filename:
                 # Extract from URL path
-                from urllib.parse import urlparse, unquote
                 parsed_url = urlparse(request.file_url)
                 path_filename = parsed_url.path.split('/')[-1]
                 if path_filename:
@@ -1750,9 +1748,6 @@ async def google_drive_to_s3(request: GoogleDriveToS3Request):
                     
                     # Look for the confirmation token in the response
                     html_content = response.text
-                    
-                    # Try to find confirm token in the HTML
-                    import re
                     
                     # Look for confirm parameter in various formats
                     confirm_match = re.search(r'confirm=([0-9A-Za-z_-]+)', html_content)
