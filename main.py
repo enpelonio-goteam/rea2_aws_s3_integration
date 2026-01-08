@@ -106,8 +106,14 @@ class GoogleDriveToS3Request(BaseModel):
     """
     Request model for downloading a file from Google Drive and uploading to S3.
     The Google Drive file must be publicly accessible (shared with "Anyone with the link").
+    
+    Accepts various Google Drive URL formats or just the file ID:
+    - File ID only: "1Rs1rijuqphRVdxT6WDcPG86x9IMKG81H"
+    - Share link: "https://drive.google.com/file/d/1Rs1rijuqphRVdxT6WDcPG86x9IMKG81H/view"
+    - Download link: "https://drive.google.com/uc?id=1Rs1rijuqphRVdxT6WDcPG86x9IMKG81H&export=download"
+    - Open link: "https://drive.google.com/open?id=1Rs1rijuqphRVdxT6WDcPG86x9IMKG81H"
     """
-    file_id: str  # Google Drive file ID (from the share link)
+    file_id: str  # Google Drive file ID or full URL (ID will be extracted automatically)
     folder_path: str  # S3 folder path (e.g., "videos/", "images/uploads/")
     filename: Optional[str] = None  # Optional filename. If not provided, will try to get from Google Drive
 
@@ -1575,31 +1581,116 @@ async def heygen_avatar_iv(
             detail=f"Failed to generate Avatar IV video: {str(e)}"
         )
 
+def extract_google_drive_file_id(file_id_or_url: str) -> str:
+    """
+    Extract Google Drive file ID from various URL formats or return the ID if already provided.
+    
+    Supported formats:
+    - File ID only: "1Rs1rijuqphRVdxT6WDcPG86x9IMKG81H"
+    - Share link: "https://drive.google.com/file/d/1Rs1rijuqphRVdxT6WDcPG86x9IMKG81H/view"
+    - Download link: "https://drive.google.com/uc?id=1Rs1rijuqphRVdxT6WDcPG86x9IMKG81H&export=download"
+    - Open link: "https://drive.google.com/open?id=1Rs1rijuqphRVdxT6WDcPG86x9IMKG81H"
+    
+    Args:
+        file_id_or_url: Either a file ID or a full Google Drive URL
+        
+    Returns:
+        The extracted file ID
+        
+    Raises:
+        ValueError: If the file ID cannot be extracted
+    """
+    import re
+    from urllib.parse import urlparse, parse_qs
+    
+    # Strip whitespace
+    file_id_or_url = file_id_or_url.strip()
+    
+    # Check if it's a URL
+    if file_id_or_url.startswith('http://') or file_id_or_url.startswith('https://'):
+        parsed_url = urlparse(file_id_or_url)
+        
+        # Check if it's a Google Drive URL
+        if 'drive.google.com' not in parsed_url.netloc and 'docs.google.com' not in parsed_url.netloc:
+            raise ValueError(f"URL is not a Google Drive link: {file_id_or_url}")
+        
+        # Try to extract from query parameter 'id'
+        # Format: https://drive.google.com/uc?id=FILE_ID&export=download
+        # Format: https://drive.google.com/open?id=FILE_ID
+        query_params = parse_qs(parsed_url.query)
+        if 'id' in query_params:
+            return query_params['id'][0]
+        
+        # Try to extract from path
+        # Format: https://drive.google.com/file/d/FILE_ID/view
+        # Format: https://drive.google.com/file/d/FILE_ID/edit
+        path_match = re.search(r'/file/d/([a-zA-Z0-9_-]+)', parsed_url.path)
+        if path_match:
+            return path_match.group(1)
+        
+        # Try to extract from folders path
+        # Format: https://drive.google.com/drive/folders/FILE_ID
+        folder_match = re.search(r'/folders/([a-zA-Z0-9_-]+)', parsed_url.path)
+        if folder_match:
+            return folder_match.group(1)
+        
+        # Try to extract ID from any part of the URL using regex
+        # Google Drive IDs are typically 28-33 characters with letters, numbers, underscores, and hyphens
+        id_match = re.search(r'([a-zA-Z0-9_-]{25,})', file_id_or_url)
+        if id_match:
+            return id_match.group(1)
+        
+        raise ValueError(f"Could not extract file ID from URL: {file_id_or_url}")
+    
+    # Check if it looks like a valid Google Drive file ID
+    # Google Drive IDs are typically alphanumeric with underscores and hyphens, 25+ characters
+    if re.match(r'^[a-zA-Z0-9_-]{10,}$', file_id_or_url):
+        return file_id_or_url
+    
+    raise ValueError(f"Invalid Google Drive file ID or URL: {file_id_or_url}")
+
 @app.post("/google-drive-to-s3")
 async def google_drive_to_s3(request: GoogleDriveToS3Request):
     """
     Download a publicly accessible file from Google Drive and upload it to AWS S3.
     
     This endpoint:
-    1. Takes a Google Drive file ID (from the share link)
+    1. Takes a Google Drive file ID or URL (various formats supported)
     2. Downloads the file with retry logic to handle large files and confirmation pages
     3. Uploads to S3 at the specified folder path
     4. Returns the public S3 URL
+    
+    Supported URL formats:
+    - File ID only: "1Rs1rijuqphRVdxT6WDcPG86x9IMKG81H"
+    - Share link: "https://drive.google.com/file/d/FILE_ID/view"
+    - Download link: "https://drive.google.com/uc?id=FILE_ID&export=download"
+    - Open link: "https://drive.google.com/open?id=FILE_ID"
     
     Note: The Google Drive file must be shared as "Anyone with the link can view"
     
     Args:
         request: GoogleDriveToS3Request containing:
-            - file_id: Google Drive file ID
+            - file_id: Google Drive file ID or URL (ID will be extracted automatically)
             - folder_path: S3 folder path (e.g., "videos/", "images/")
             - filename: Optional filename (auto-detected if not provided)
     
     Returns:
         JSON response with the public S3 URL of the uploaded file
     """
-    logger.info(f"Google Drive to S3 request received - File ID: {request.file_id}, Folder: {request.folder_path}")
+    logger.info(f"Google Drive to S3 request received - Input: {request.file_id}, Folder: {request.folder_path}")
     
     try:
+        # Extract file ID from URL or use as-is if already an ID
+        try:
+            file_id = extract_google_drive_file_id(request.file_id)
+            logger.info(f"Extracted Google Drive file ID: {file_id}")
+        except ValueError as e:
+            logger.error(f"Failed to extract file ID: {str(e)}")
+            raise HTTPException(
+                status_code=400,
+                detail=str(e)
+            )
+        
         # Validate required AWS environment variables
         if not all([AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, S3_BUCKET_NAME]):
             logger.error("Missing required AWS environment variables")
@@ -1622,7 +1713,7 @@ async def google_drive_to_s3(request: GoogleDriveToS3Request):
             folder_path = folder_path + '/'
         
         # Google Drive download URL for publicly shared files
-        download_url = f"https://drive.google.com/uc?export=download&id={request.file_id}"
+        download_url = f"https://drive.google.com/uc?export=download&id={file_id}"
         
         # Configure retry settings
         max_retries = 3
@@ -1637,7 +1728,7 @@ async def google_drive_to_s3(request: GoogleDriveToS3Request):
         
         for attempt in range(max_retries):
             try:
-                logger.info(f"Download attempt {attempt + 1}/{max_retries} for file ID: {request.file_id}")
+                logger.info(f"Download attempt {attempt + 1}/{max_retries} for file ID: {file_id}")
                 
                 # Initial request
                 response = session.get(
@@ -1670,7 +1761,7 @@ async def google_drive_to_s3(request: GoogleDriveToS3Request):
                         logger.info(f"Found confirmation token: {confirm_token}")
                         
                         # Make the confirmed download request
-                        confirmed_url = f"https://drive.google.com/uc?export=download&id={request.file_id}&confirm={confirm_token}"
+                        confirmed_url = f"https://drive.google.com/uc?export=download&id={file_id}&confirm={confirm_token}"
                         response = session.get(
                             confirmed_url,
                             stream=True,
@@ -1685,7 +1776,7 @@ async def google_drive_to_s3(request: GoogleDriveToS3Request):
                         uuid_match = re.search(r'uuid=([0-9A-Za-z_-]+)', html_content)
                         if uuid_match:
                             # Use the download_warning cookie approach
-                            confirmed_url = f"https://drive.google.com/uc?export=download&id={request.file_id}&confirm=t"
+                            confirmed_url = f"https://drive.google.com/uc?export=download&id={file_id}&confirm=t"
                             response = session.get(
                                 confirmed_url,
                                 stream=True,
@@ -1809,7 +1900,8 @@ async def google_drive_to_s3(request: GoogleDriveToS3Request):
             "filename": filename,
             "folder_path": folder_path,
             "s3_key": s3_key,
-            "file_id": request.file_id,
+            "file_id": file_id,
+            "original_input": request.file_id,
             "file_size_bytes": content_length,
             "content_type": content_type,
             "uploaded_at": datetime.now().isoformat()
