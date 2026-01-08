@@ -14,6 +14,8 @@ import base64
 import io
 import tempfile
 import time
+import re
+from urllib.parse import urlparse, parse_qs, unquote
 import loomdl
 import assemblyai as aai
 
@@ -1600,8 +1602,6 @@ def extract_google_drive_file_id(file_id_or_url: str) -> str:
     Raises:
         ValueError: If the file ID cannot be extracted
     """
-    import re
-    from urllib.parse import urlparse, parse_qs
     
     # Strip whitespace
     file_id_or_url = file_id_or_url.strip()
@@ -1811,7 +1811,6 @@ async def google_drive_to_s3(request: GoogleDriveToS3Request):
                         # Parse filename from header
                         filename_match = re.search(r'filename\*?=["\']?(?:UTF-8\'\')?([^"\';\s]+)["\']?', content_disposition)
                         if filename_match:
-                            from urllib.parse import unquote
                             filename = unquote(filename_match.group(1))
                             logger.info(f"Extracted filename from header: {filename}")
                 
