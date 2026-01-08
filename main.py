@@ -102,6 +102,15 @@ class HeyGenAvatarIVRequest(BaseModel):
     audio_url: Optional[str] = None  # URL of an audio file to use instead of TTS
     audio_asset_id: Optional[str] = None  # Asset ID of a previously uploaded audio file
 
+class GoogleDriveToS3Request(BaseModel):
+    """
+    Request model for downloading a file from Google Drive and uploading to S3.
+    The Google Drive file must be publicly accessible (shared with "Anyone with the link").
+    """
+    file_id: str  # Google Drive file ID (from the share link)
+    folder_path: str  # S3 folder path (e.g., "videos/", "images/uploads/")
+    filename: Optional[str] = None  # Optional filename. If not provided, will try to get from Google Drive
+
 app = FastAPI(title="Logic Provider Functions", version="1.0.0")
 
 # AWS S3 configuration
@@ -148,7 +157,7 @@ async def root():
     return {
         "message": "Logic Provider Functions API", 
         "status": "running",
-        "endpoints": ["/upload-html", "/generate-image", "/html-to-image", "/process-loom-video", "/upload-linkedin-video", "/url-to-google-drive", "/eleven-labs-speech", "/heygen-avatar-iv", "/health"],
+        "endpoints": ["/upload-html", "/generate-image", "/html-to-image", "/process-loom-video", "/upload-linkedin-video", "/url-to-google-drive", "/eleven-labs-speech", "/heygen-avatar-iv", "/google-drive-to-s3", "/health"],
         "aws_configured": bool(AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY and S3_BUCKET_NAME),
         "timestamp": datetime.now().isoformat()
     }
@@ -1564,6 +1573,258 @@ async def heygen_avatar_iv(
         raise HTTPException(
             status_code=500,
             detail=f"Failed to generate Avatar IV video: {str(e)}"
+        )
+
+@app.post("/google-drive-to-s3")
+async def google_drive_to_s3(request: GoogleDriveToS3Request):
+    """
+    Download a publicly accessible file from Google Drive and upload it to AWS S3.
+    
+    This endpoint:
+    1. Takes a Google Drive file ID (from the share link)
+    2. Downloads the file with retry logic to handle large files and confirmation pages
+    3. Uploads to S3 at the specified folder path
+    4. Returns the public S3 URL
+    
+    Note: The Google Drive file must be shared as "Anyone with the link can view"
+    
+    Args:
+        request: GoogleDriveToS3Request containing:
+            - file_id: Google Drive file ID
+            - folder_path: S3 folder path (e.g., "videos/", "images/")
+            - filename: Optional filename (auto-detected if not provided)
+    
+    Returns:
+        JSON response with the public S3 URL of the uploaded file
+    """
+    logger.info(f"Google Drive to S3 request received - File ID: {request.file_id}, Folder: {request.folder_path}")
+    
+    try:
+        # Validate required AWS environment variables
+        if not all([AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, S3_BUCKET_NAME]):
+            logger.error("Missing required AWS environment variables")
+            raise HTTPException(
+                status_code=500,
+                detail="AWS credentials or bucket name not configured"
+            )
+        
+        # Check if S3 client is available
+        if not s3_client:
+            logger.error("S3 client not initialized")
+            raise HTTPException(
+                status_code=500,
+                detail="S3 client not available - check AWS configuration"
+            )
+        
+        # Normalize folder path (ensure it ends with / and doesn't start with /)
+        folder_path = request.folder_path.strip('/')
+        if folder_path:
+            folder_path = folder_path + '/'
+        
+        # Google Drive download URL for publicly shared files
+        download_url = f"https://drive.google.com/uc?export=download&id={request.file_id}"
+        
+        # Configure retry settings
+        max_retries = 3
+        retry_delay = 2  # seconds
+        
+        file_content = None
+        filename = request.filename
+        content_type = "application/octet-stream"
+        
+        # Create a session to handle cookies (needed for large file confirmation)
+        session = requests.Session()
+        
+        for attempt in range(max_retries):
+            try:
+                logger.info(f"Download attempt {attempt + 1}/{max_retries} for file ID: {request.file_id}")
+                
+                # Initial request
+                response = session.get(
+                    download_url,
+                    stream=True,
+                    timeout=30,
+                    headers={
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                    }
+                )
+                response.raise_for_status()
+                
+                # Check if we got a confirmation page (for large files)
+                # Google Drive returns HTML with a confirmation token for large files
+                content_type_header = response.headers.get('Content-Type', '')
+                
+                if 'text/html' in content_type_header:
+                    logger.info("Received HTML response, checking for download confirmation...")
+                    
+                    # Look for the confirmation token in the response
+                    html_content = response.text
+                    
+                    # Try to find confirm token in the HTML
+                    import re
+                    
+                    # Look for confirm parameter in various formats
+                    confirm_match = re.search(r'confirm=([0-9A-Za-z_-]+)', html_content)
+                    if confirm_match:
+                        confirm_token = confirm_match.group(1)
+                        logger.info(f"Found confirmation token: {confirm_token}")
+                        
+                        # Make the confirmed download request
+                        confirmed_url = f"https://drive.google.com/uc?export=download&id={request.file_id}&confirm={confirm_token}"
+                        response = session.get(
+                            confirmed_url,
+                            stream=True,
+                            timeout=300,  # 5 minutes for large files
+                            headers={
+                                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                            }
+                        )
+                        response.raise_for_status()
+                    else:
+                        # Try alternative confirmation approach - look for uuid
+                        uuid_match = re.search(r'uuid=([0-9A-Za-z_-]+)', html_content)
+                        if uuid_match:
+                            # Use the download_warning cookie approach
+                            confirmed_url = f"https://drive.google.com/uc?export=download&id={request.file_id}&confirm=t"
+                            response = session.get(
+                                confirmed_url,
+                                stream=True,
+                                timeout=300,
+                                headers={
+                                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                                }
+                            )
+                            response.raise_for_status()
+                        else:
+                            logger.warning("Could not find confirmation token, file may not be downloadable")
+                
+                # Check content type again after potential redirect
+                content_type_header = response.headers.get('Content-Type', 'application/octet-stream')
+                if ';' in content_type_header:
+                    content_type = content_type_header.split(';')[0].strip()
+                else:
+                    content_type = content_type_header
+                
+                # If we still have HTML, the file might not be publicly accessible
+                if 'text/html' in content_type:
+                    logger.error("File appears to not be publicly accessible or doesn't exist")
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Unable to download file. Please ensure the Google Drive file is shared as 'Anyone with the link can view'"
+                    )
+                
+                # Try to get filename from Content-Disposition header if not provided
+                if not filename:
+                    content_disposition = response.headers.get('Content-Disposition', '')
+                    if 'filename=' in content_disposition:
+                        # Parse filename from header
+                        filename_match = re.search(r'filename\*?=["\']?(?:UTF-8\'\')?([^"\';\s]+)["\']?', content_disposition)
+                        if filename_match:
+                            from urllib.parse import unquote
+                            filename = unquote(filename_match.group(1))
+                            logger.info(f"Extracted filename from header: {filename}")
+                
+                # Generate filename if still not available
+                if not filename:
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    unique_id = str(uuid.uuid4())[:8]
+                    
+                    # Determine extension based on content type
+                    extension_map = {
+                        'image/jpeg': '.jpg',
+                        'image/png': '.png',
+                        'image/gif': '.gif',
+                        'image/webp': '.webp',
+                        'video/mp4': '.mp4',
+                        'video/webm': '.webm',
+                        'video/quicktime': '.mov',
+                        'audio/mpeg': '.mp3',
+                        'audio/wav': '.wav',
+                        'audio/ogg': '.ogg',
+                        'application/pdf': '.pdf',
+                        'text/plain': '.txt',
+                        'application/zip': '.zip',
+                    }
+                    extension = extension_map.get(content_type, '')
+                    filename = f"gdrive_file_{timestamp}_{unique_id}{extension}"
+                    logger.info(f"Generated filename: {filename}")
+                
+                # Download the file content
+                logger.info("Downloading file content...")
+                file_content = response.content
+                content_length = len(file_content)
+                
+                if content_length == 0:
+                    raise Exception("Downloaded file is empty")
+                
+                logger.info(f"File downloaded successfully. Size: {content_length} bytes ({content_length / (1024*1024):.2f} MB)")
+                
+                # Success - break out of retry loop
+                break
+                
+            except requests.exceptions.RequestException as e:
+                logger.warning(f"Download attempt {attempt + 1} failed: {str(e)}")
+                if attempt < max_retries - 1:
+                    logger.info(f"Retrying in {retry_delay} seconds...")
+                    time.sleep(retry_delay)
+                    retry_delay *= 2  # Exponential backoff
+                else:
+                    logger.error(f"All {max_retries} download attempts failed")
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"Failed to download file from Google Drive after {max_retries} attempts: {str(e)}"
+                    )
+        
+        if file_content is None:
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to download file content"
+            )
+        
+        # Build the full S3 key (folder path + filename)
+        s3_key = f"{folder_path}{filename}"
+        
+        logger.info(f"Uploading to S3 - Bucket: {S3_BUCKET_NAME}, Key: {s3_key}")
+        
+        # Upload to S3
+        s3_client.put_object(
+            Bucket=S3_BUCKET_NAME,
+            Key=s3_key,
+            Body=file_content,
+            ContentType=content_type,
+            ACL='public-read'
+        )
+        
+        logger.info(f"File uploaded to S3 successfully: {s3_key}")
+        
+        # Generate public URL
+        public_url = f"https://{S3_BUCKET_NAME}.s3.{AWS_REGION}.amazonaws.com/{s3_key}"
+        logger.info(f"Generated public URL: {public_url}")
+        
+        # Return success response
+        response_data = {
+            "success": True,
+            "message": "File downloaded from Google Drive and uploaded to S3 successfully",
+            "public_url": public_url,
+            "filename": filename,
+            "folder_path": folder_path,
+            "s3_key": s3_key,
+            "file_id": request.file_id,
+            "file_size_bytes": content_length,
+            "content_type": content_type,
+            "uploaded_at": datetime.now().isoformat()
+        }
+        
+        logger.info("Google Drive to S3 transfer completed successfully")
+        return JSONResponse(status_code=200, content=response_data)
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error during Google Drive to S3 transfer: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to transfer file from Google Drive to S3: {str(e)}"
         )
 
 @app.get("/health")
