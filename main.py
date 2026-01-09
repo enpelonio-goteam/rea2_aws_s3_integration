@@ -16,6 +16,8 @@ import tempfile
 import time
 import re
 from urllib.parse import urlparse, parse_qs, unquote
+from mutagen.mp3 import MP3
+from io import BytesIO
 import loomdl
 import assemblyai as aai
 
@@ -1310,6 +1312,16 @@ async def eleven_labs_speech(
         audio_content = response.content
         content_length = len(audio_content)
         
+        # Calculate audio duration using mutagen
+        audio_duration_seconds = None
+        try:
+            audio_file = BytesIO(audio_content)
+            audio = MP3(audio_file)
+            audio_duration_seconds = round(audio.info.length, 2)  # Round to 2 decimal places
+            logger.info(f"Audio duration: {audio_duration_seconds} seconds")
+        except Exception as e:
+            logger.warning(f"Could not determine audio duration: {str(e)}")
+        
         logger.info(f"Audio generated successfully. Size: {content_length} bytes ({content_length / 1024:.2f} KB)")
         
         # Generate filename if not provided
@@ -1353,6 +1365,7 @@ async def eleven_labs_speech(
             "voice_settings": voice_settings,
             "text_length": len(request.text),
             "audio_size_bytes": content_length,
+            "audio_duration_seconds": audio_duration_seconds,
             "generated_at": datetime.now().isoformat()
         }
         
