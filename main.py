@@ -121,6 +121,9 @@ class GoogleDriveToS3Request(BaseModel):
     folder_path: str  # S3 folder path (e.g., "videos/", "images/uploads/")
     filename: Optional[str] = None  # Optional filename. If not provided, will try to get from Google Drive
 
+class TranscribeAudioRequest(BaseModel):
+    audio_url: str  # Publicly accessible URL to the audio file
+
 app = FastAPI(title="Logic Provider Functions", version="1.0.0")
 
 # AWS S3 configuration
@@ -167,7 +170,7 @@ async def root():
     return {
         "message": "Logic Provider Functions API", 
         "status": "running",
-        "endpoints": ["/upload-html", "/generate-image", "/html-to-image", "/process-loom-video", "/upload-linkedin-video", "/url-to-google-drive", "/eleven-labs-speech", "/heygen-avatar-iv", "/google-drive-to-s3", "/health"],
+        "endpoints": ["/upload-html", "/generate-image", "/html-to-image", "/process-loom-video", "/upload-linkedin-video", "/url-to-google-drive", "/eleven-labs-speech", "/heygen-avatar-iv", "/google-drive-to-s3", "/telegram-file/bot{BotToken}/{file_path}", "/transcribe-audio", "/health"],
         "aws_configured": bool(AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY and S3_BUCKET_NAME),
         "timestamp": datetime.now().isoformat()
     }
@@ -1594,6 +1597,114 @@ async def heygen_avatar_iv(
             detail=f"Failed to generate Avatar IV video: {str(e)}"
         )
 
+@app.get("/telegram-file/bot{bot_token}/{file_path:path}")
+async def telegram_file_to_s3(bot_token: str, file_path: str):
+    """
+    Download a Telegram file using bot token and file path, upload to S3 under audio/, and return the public URL.
+
+    Telegram download URL format:
+    https://api.telegram.org/file/bot<token>/<file_path>
+    """
+    logger.info(f"Telegram file request received - Path: {file_path}")
+
+    try:
+        # Validate required AWS environment variables
+        if not all([AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, S3_BUCKET_NAME]):
+            logger.error("Missing required AWS environment variables")
+            raise HTTPException(
+                status_code=500,
+                detail="AWS credentials or bucket name not configured"
+            )
+
+        # Check if S3 client is available
+        if not s3_client:
+            logger.error("S3 client not initialized")
+            raise HTTPException(
+                status_code=500,
+                detail="S3 client not available - check AWS configuration"
+            )
+
+        # Build Telegram file download URL
+        telegram_url = f"https://api.telegram.org/file/bot{bot_token}/{file_path}"
+        logger.info(f"Downloading Telegram file from: {telegram_url}")
+
+        try:
+            download_response = requests.get(
+                telegram_url,
+                timeout=300,
+                stream=True
+            )
+            download_response.raise_for_status()
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to download Telegram file: {str(e)}")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Failed to download Telegram file: {str(e)}"
+            )
+
+        file_content = download_response.content
+        if not file_content:
+            logger.error("Downloaded Telegram file is empty")
+            raise HTTPException(
+                status_code=400,
+                detail="Downloaded Telegram file is empty"
+            )
+
+        # Determine content type
+        content_type = download_response.headers.get('Content-Type', 'application/octet-stream')
+        if ';' in content_type:
+            content_type = content_type.split(';')[0].strip()
+
+        # Determine filename from file_path
+        filename = os.path.basename(file_path)
+        if not filename:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            unique_id = str(uuid.uuid4())[:8]
+            filename = f"telegram_audio_{timestamp}_{unique_id}"
+
+        # Ensure audio/ prefix
+        s3_key = filename
+        if not s3_key.startswith("audio/"):
+            s3_key = f"audio/{s3_key}"
+
+        logger.info(f"Uploading Telegram file to S3 - Bucket: {S3_BUCKET_NAME}, Key: {s3_key}")
+
+        # Upload to S3
+        s3_client.put_object(
+            Bucket=S3_BUCKET_NAME,
+            Key=s3_key,
+            Body=file_content,
+            ContentType=content_type,
+            ACL='public-read'
+        )
+
+        logger.info(f"Telegram file uploaded to S3 successfully: {s3_key}")
+
+        # Generate public URL
+        public_url = f"https://{S3_BUCKET_NAME}.s3.{AWS_REGION}.amazonaws.com/{s3_key}"
+        logger.info(f"Generated public URL: {public_url}")
+
+        response_data = {
+            "success": True,
+            "message": "Telegram file downloaded and uploaded successfully",
+            "public_url": public_url,
+            "filename": filename,
+            "s3_key": s3_key,
+            "content_type": content_type,
+            "uploaded_at": datetime.now().isoformat()
+        }
+
+        return JSONResponse(status_code=200, content=response_data)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error during Telegram file upload: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to process Telegram file: {str(e)}"
+        )
+
 def extract_google_drive_file_id(file_id_or_url: str) -> str:
     """
     Extract Google Drive file ID from various URL formats or return the ID if already provided.
@@ -1924,6 +2035,137 @@ async def google_drive_to_s3(request: GoogleDriveToS3Request):
         raise HTTPException(
             status_code=500,
             detail=f"Failed to transfer file from Google Drive to S3: {str(e)}"
+        )
+
+@app.post("/transcribe-audio")
+async def transcribe_audio(
+    request: TranscribeAudioRequest,
+    authorization: Optional[str] = Header(None)
+):
+    """
+    Transcribe an audio file using OpenAI's transcription API.
+
+    Requires:
+    - Authorization: Bearer <OpenAI API key>
+    - Request body with audio_url
+    """
+    logger.info(f"Transcription request received - Audio URL: {request.audio_url}")
+
+    try:
+        # Validate authorization header
+        if not authorization or not authorization.lower().startswith("bearer "):
+            logger.error("Missing or invalid authorization header")
+            raise HTTPException(
+                status_code=401,
+                detail="Authorization header with Bearer token is required"
+            )
+
+        # Extract API key from authorization header
+        api_key = authorization.split(" ", 1)[1].strip()
+
+        # Download audio file
+        logger.info(f"Downloading audio from URL: {request.audio_url}")
+        try:
+            audio_response = requests.get(
+                request.audio_url,
+                timeout=300,
+                stream=True
+            )
+            audio_response.raise_for_status()
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to download audio file: {str(e)}")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Failed to download audio file: {str(e)}"
+            )
+
+        audio_content = audio_response.content
+        if not audio_content:
+            logger.error("Downloaded audio file is empty")
+            raise HTTPException(
+                status_code=400,
+                detail="Downloaded audio file is empty"
+            )
+
+        # Determine content type and filename
+        content_type = audio_response.headers.get('Content-Type', 'application/octet-stream')
+        if ';' in content_type:
+            content_type = content_type.split(';')[0].strip()
+
+        filename = None
+        content_disposition = audio_response.headers.get('Content-Disposition', '')
+        if 'filename=' in content_disposition:
+            match = re.search(r'filename[*]?=["\']?([^"\';\s]+)["\']?', content_disposition)
+            if match:
+                filename = match.group(1)
+
+        if not filename:
+            parsed_url = urlparse(request.audio_url)
+            path_filename = parsed_url.path.split('/')[-1]
+            if path_filename:
+                filename = unquote(path_filename)
+            else:
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                unique_id = str(uuid.uuid4())[:8]
+                filename = f"audio_{timestamp}_{unique_id}"
+
+        # Call OpenAI transcription API
+        openai_url = "https://api.openai.com/v1/audio/transcriptions"
+        openai_headers = {
+            "Authorization": f"Bearer {api_key}"
+        }
+
+        files = {
+            "file": (filename, audio_content, content_type)
+        }
+        data = {
+            "model": "whisper-1"
+        }
+
+        logger.info("Calling OpenAI transcription API")
+        openai_response = requests.post(
+            openai_url,
+            headers=openai_headers,
+            files=files,
+            data=data,
+            timeout=300
+        )
+
+        if openai_response.status_code != 200:
+            logger.error(f"OpenAI API error: {openai_response.status_code} - {openai_response.text}")
+            raise HTTPException(
+                status_code=openai_response.status_code,
+                detail=f"OpenAI API error: {openai_response.text}"
+            )
+
+        response_json = openai_response.json()
+        transcript_text = response_json.get("text")
+
+        if not transcript_text:
+            logger.error(f"No transcript returned from OpenAI: {response_json}")
+            raise HTTPException(
+                status_code=500,
+                detail="No transcript returned from OpenAI"
+            )
+
+        response_data = {
+            "success": True,
+            "message": "Transcription completed successfully",
+            "transcript": transcript_text,
+            "filename": filename,
+            "content_type": content_type,
+            "transcribed_at": datetime.now().isoformat()
+        }
+
+        return JSONResponse(status_code=200, content=response_data)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error during transcription: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to transcribe audio: {str(e)}"
         )
 
 @app.get("/health")
