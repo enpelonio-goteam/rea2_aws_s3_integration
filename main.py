@@ -11,15 +11,18 @@ import logging
 from dotenv import load_dotenv
 import requests
 import base64
+import mimetypes
 import io
 import tempfile
 import time
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse, parse_qs, unquote
 from mutagen.mp3 import MP3
 from io import BytesIO
 import loomdl
 import assemblyai as aai
+from PIL import Image, ImageOps
 
 # Load environment variables from .env file
 load_dotenv()
@@ -124,6 +127,12 @@ class GoogleDriveToS3Request(BaseModel):
 class TranscribeAudioRequest(BaseModel):
     audio_url: str  # Publicly accessible URL to the audio file
 
+class AnalyzeImagesRequest(BaseModel):
+    prompt: str
+    image_urls: str  # Comma-separated list of image URLs
+    model: str
+    reasoning_effort: Optional[str] = "none"
+
 app = FastAPI(title="Logic Provider Functions", version="1.0.0")
 
 # AWS S3 configuration
@@ -170,7 +179,7 @@ async def root():
     return {
         "message": "Logic Provider Functions API", 
         "status": "running",
-        "endpoints": ["/upload-html", "/generate-image", "/html-to-image", "/process-loom-video", "/upload-linkedin-video", "/url-to-google-drive", "/eleven-labs-speech", "/heygen-avatar-iv", "/google-drive-to-s3", "/telegram-file/bot{BotToken}/{file_path}", "/transcribe-audio", "/health"],
+        "endpoints": ["/upload-html", "/generate-image", "/html-to-image", "/process-loom-video", "/upload-linkedin-video", "/url-to-google-drive", "/eleven-labs-speech", "/heygen-avatar-iv", "/google-drive-to-s3", "/telegram-file/bot{BotToken}/{file_path}", "/transcribe-audio", "/analyze-images", "/health"],
         "aws_configured": bool(AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY and S3_BUCKET_NAME),
         "timestamp": datetime.now().isoformat()
     }
@@ -2166,6 +2175,274 @@ async def transcribe_audio(
         raise HTTPException(
             status_code=500,
             detail=f"Failed to transcribe audio: {str(e)}"
+        )
+
+@app.post("/analyze-images")
+async def analyze_images(
+    request: AnalyzeImagesRequest,
+    authorization: Optional[str] = Header(None)
+):
+    """
+    Analyze multiple images using a single OpenAI request.
+
+    Request body:
+    - prompt: Analysis prompt
+    - image_urls: Comma-separated image URLs
+    - model: OpenAI model to use
+    - reasoning_effort: Optional reasoning effort (empty string becomes "none")
+    """
+    logger.info("Analyze images request received")
+
+    try:
+        request_started_at = time.perf_counter()
+        # Validate authorization header
+        if not authorization or not authorization.lower().startswith("bearer "):
+            logger.error("Missing or invalid authorization header")
+            raise HTTPException(
+                status_code=401,
+                detail="Authorization header with Bearer token is required"
+            )
+
+        # Extract API key from authorization header
+        api_key = authorization.split(" ", 1)[1].strip()
+
+        # Parse and clean URL list
+        urls = [
+            u.strip().replace(" ", "%20")
+            for u in request.image_urls.split(",")
+            if u.strip()
+        ]
+
+        if len(urls) == 0:
+            logger.error("No valid image URLs found in image_urls")
+            raise HTTPException(
+                status_code=400,
+                detail="image_urls must contain at least one valid URL"
+            )
+
+        content_array = [
+            {"type": "text", "text": request.prompt}
+        ]
+
+        total_original_bytes = 0
+        total_optimized_bytes = 0
+
+        def download_single_image(index: int, url: str):
+            logger.info(f"Downloading image {index + 1}/{len(urls)}")
+            try:
+                image_response = requests.get(
+                    url,
+                    timeout=180,
+                    stream=True
+                )
+                image_response.raise_for_status()
+            except requests.exceptions.RequestException as e:
+                logger.error(f"Failed to download image at index {index}: {str(e)}")
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Failed to download image at index {index}: {str(e)}"
+                )
+
+            image_bytes = image_response.content
+            if not image_bytes:
+                logger.error(f"Downloaded image at index {index} is empty")
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Downloaded image at index {index} is empty"
+                )
+
+            content_type = image_response.headers.get("Content-Type", "").split(";")[0].strip()
+            if not content_type:
+                parsed_url = urlparse(url)
+                guessed_content_type, _ = mimetypes.guess_type(parsed_url.path)
+                content_type = guessed_content_type or "image/jpeg"
+
+            return {
+                "index": index,
+                "url": url,
+                "image_bytes": image_bytes,
+                "content_type": content_type
+            }
+
+        # Download images in parallel to reduce total wall-clock time.
+        download_started_at = time.perf_counter()
+        max_workers = min(8, len(urls))
+        logger.info(f"Starting parallel image downloads with {max_workers} workers")
+        downloaded_images = {}
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_map = {
+                executor.submit(download_single_image, index, url): index
+                for index, url in enumerate(urls)
+            }
+            for future in as_completed(future_map):
+                result = future.result()
+                downloaded_images[result["index"]] = result
+        download_elapsed_seconds = time.perf_counter() - download_started_at
+
+        def process_single_image(image_item: dict):
+            index = image_item["index"]
+            image_bytes = image_item["image_bytes"]
+            content_type = image_item["content_type"]
+
+            original_size = len(image_bytes)
+
+            # Optimize image bytes to reduce payload size/timeouts.
+            optimized_bytes = image_bytes
+            optimized_content_type = content_type
+            try:
+                with Image.open(BytesIO(image_bytes)) as img:
+                    # Honor EXIF orientation before resizing.
+                    img = ImageOps.exif_transpose(img)
+
+                    max_dimension = 1568
+                    if max(img.size) > max_dimension:
+                        img.thumbnail((max_dimension, max_dimension), Image.Resampling.LANCZOS)
+
+                    output = BytesIO()
+                    has_alpha = img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info)
+
+                    if has_alpha:
+                        img.save(output, format="PNG", optimize=True, compress_level=9)
+                        optimized_content_type = "image/png"
+                    else:
+                        if img.mode not in ("RGB", "L"):
+                            img = img.convert("RGB")
+                        img.save(output, format="JPEG", quality=82, optimize=True, progressive=True)
+                        optimized_content_type = "image/jpeg"
+
+                    candidate_bytes = output.getvalue()
+                    if candidate_bytes and len(candidate_bytes) < len(image_bytes):
+                        optimized_bytes = candidate_bytes
+            except Exception as e:
+                logger.warning(f"Image optimization failed at index {index}, using original bytes: {str(e)}")
+
+            optimized_size = len(optimized_bytes)
+            logger.info(
+                f"Image {index} size bytes - original: {original_size}, optimized: {optimized_size}, content-type: {optimized_content_type}"
+            )
+
+            encoded_image = base64.b64encode(optimized_bytes).decode("utf-8")
+            data_url = f"data:{optimized_content_type};base64,{encoded_image}"
+
+            return {
+                "index": index,
+                "original_size": original_size,
+                "optimized_size": optimized_size,
+                "label": {
+                    "type": "text",
+                    "text": f"Image Index {index}:"
+                },
+                "image": {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": data_url
+                    }
+                }
+            }
+
+        # Process images in parallel, then build content array in original order.
+        processing_started_at = time.perf_counter()
+        process_workers = min(6, len(urls))
+        logger.info(f"Starting parallel image processing with {process_workers} workers")
+        processed_images = {}
+        with ThreadPoolExecutor(max_workers=process_workers) as executor:
+            process_future_map = {
+                executor.submit(process_single_image, image_item): image_item["index"]
+                for image_item in downloaded_images.values()
+            }
+            for future in as_completed(process_future_map):
+                result = future.result()
+                processed_images[result["index"]] = result
+        processing_elapsed_seconds = time.perf_counter() - processing_started_at
+
+        for index in range(len(urls)):
+            processed = processed_images[index]
+            total_original_bytes += processed["original_size"]
+            total_optimized_bytes += processed["optimized_size"]
+            content_array.append(processed["label"])
+            content_array.append(processed["image"])
+
+        reasoning_effort = request.reasoning_effort if request.reasoning_effort != "" else "none"
+
+        openai_payload = {
+            "model": request.model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": content_array
+                }
+            ],
+            "reasoning_effort": reasoning_effort
+        }
+
+        openai_headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        }
+
+        logger.info(f"Sending image analysis request to OpenAI for {len(urls)} images")
+        openai_started_at = time.perf_counter()
+        openai_response = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers=openai_headers,
+            json=openai_payload,
+            timeout=600
+        )
+        openai_elapsed_seconds = time.perf_counter() - openai_started_at
+
+        if openai_response.status_code != 200:
+            logger.error(f"OpenAI API error: {openai_response.status_code} - {openai_response.text}")
+            raise HTTPException(
+                status_code=openai_response.status_code,
+                detail=f"OpenAI API error: {openai_response.text}"
+            )
+
+        response_json = openai_response.json()
+        analysis_text = ""
+        if response_json.get("choices") and len(response_json["choices"]) > 0:
+            analysis_text = response_json["choices"][0].get("message", {}).get("content", "")
+
+        total_elapsed_seconds = time.perf_counter() - request_started_at
+        logger.info(
+            f"Analyze images timing - total: {total_elapsed_seconds:.2f}s, "
+            f"download: {download_elapsed_seconds:.2f}s, "
+            f"processing: {processing_elapsed_seconds:.2f}s, "
+            f"openai: {openai_elapsed_seconds:.2f}s, "
+            f"image_count: {len(urls)}"
+        )
+
+        return JSONResponse(
+            status_code=200,
+            content={
+                "success": True,
+                "message": "Image analysis completed successfully",
+                "image_count": len(urls),
+                "model": request.model,
+                "reasoning_effort": reasoning_effort,
+                "analysis": analysis_text,
+                "raw_response": response_json,
+                "payload_bytes": {
+                    "original_total": total_original_bytes,
+                    "optimized_total": total_optimized_bytes,
+                    "saved_bytes": max(total_original_bytes - total_optimized_bytes, 0)
+                },
+                "timings_seconds": {
+                    "download": round(download_elapsed_seconds, 3),
+                    "processing": round(processing_elapsed_seconds, 3),
+                    "openai": round(openai_elapsed_seconds, 3),
+                    "total": round(total_elapsed_seconds, 3)
+                },
+                "analyzed_at": datetime.now().isoformat()
+            }
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error during image analysis: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to analyze images: {str(e)}"
         )
 
 @app.get("/health")

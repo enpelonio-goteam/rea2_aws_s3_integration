@@ -7,3 +7,4 @@ python-dotenv==1.0.0
 requests==2.31.0
 assemblyai==0.20.0
 mutagen==1.47.0
+Pillow
