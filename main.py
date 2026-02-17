@@ -1552,15 +1552,85 @@ async def heygen_avatar_iv(
             )
         
         logger.info(f"Image uploaded to HeyGen successfully. Image key: {image_key}")
-        
-        # Step 3: Generate video using HeyGen v2 endpoint
-        logger.info("Generating Avatar IV video via v2/video/generate...")
-        
-        generate_url = "https://api.heygen.com/v2/video/generate"
-        generate_headers = {
+
+        # Step 3: Create a photo avatar look from uploaded image_key.
+        # /v2/video/generate requires a valid talking_photo_id (avatar/look id), not raw image_key.
+        logger.info("Creating HeyGen photo avatar look from uploaded image...")
+        create_look_url = "https://api.heygen.com/v2/photo_avatar/avatar_group/create"
+        look_name = request.video_title or f"avatar_iv_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        create_look_payload = {
+            "name": look_name,
+            "image_key": image_key
+        }
+        heygen_json_headers = {
             "X-Api-Key": x_api_key,
             "Content-Type": "application/json"
         }
+
+        create_look_response = requests.post(
+            create_look_url,
+            headers=heygen_json_headers,
+            json=create_look_payload,
+            timeout=120
+        )
+
+        if create_look_response.status_code != 200:
+            logger.error(f"HeyGen create photo avatar look failed: {create_look_response.status_code} - {create_look_response.text}")
+            raise HTTPException(
+                status_code=create_look_response.status_code,
+                detail=f"Failed to create HeyGen photo avatar look: {create_look_response.text}"
+            )
+
+        create_look_data = create_look_response.json()
+        talking_photo_id = (create_look_data.get("data") or {}).get("id")
+        if not talking_photo_id:
+            logger.error(f"Could not extract talking_photo_id from create look response: {create_look_data}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Could not extract talking_photo_id from HeyGen create look response: {create_look_data}"
+            )
+
+        logger.info(f"Created photo avatar look id: {talking_photo_id}. Polling until ready...")
+
+        # Step 4: Poll look status until completed (or timeout/failure)
+        details_url = f"https://api.heygen.com/v2/photo_avatar/{talking_photo_id}"
+        max_polls = 30
+        poll_interval_seconds = 4
+        look_status = None
+
+        for _ in range(max_polls):
+            details_response = requests.get(details_url, headers={"X-Api-Key": x_api_key}, timeout=60)
+            if details_response.status_code != 200:
+                logger.warning(f"HeyGen look status poll failed: {details_response.status_code} - {details_response.text}")
+                time.sleep(poll_interval_seconds)
+                continue
+
+            details_data = details_response.json()
+            look_status = ((details_data.get("data") or {}).get("status") or "").lower()
+            if look_status == "completed":
+                logger.info(f"HeyGen look is ready: {talking_photo_id}")
+                break
+            if look_status in {"moderation_rejected", "in_appeal", "failed"}:
+                logger.error(f"HeyGen look not usable. Status: {look_status}, details: {details_data}")
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"HeyGen look status is '{look_status}'. Details: {details_data}"
+                )
+
+            time.sleep(poll_interval_seconds)
+
+        if look_status != "completed":
+            logger.error(f"Timed out waiting for HeyGen look readiness. Last status: {look_status}, look_id: {talking_photo_id}")
+            raise HTTPException(
+                status_code=504,
+                detail=f"Timed out waiting for HeyGen talking photo to be ready. look_id: {talking_photo_id}, last_status: {look_status}"
+            )
+        
+        # Step 5: Generate video using HeyGen v2 endpoint
+        logger.info("Generating Avatar IV video via v2/video/generate...")
+        
+        generate_url = "https://api.heygen.com/v2/video/generate"
+        generate_headers = heygen_json_headers
 
         # Build voice object for v2 schema
         if has_text_mode:
@@ -1583,8 +1653,7 @@ async def heygen_avatar_iv(
                 {
                     "character": {
                         "type": "talking_photo",
-                        # image_key returned by upload endpoint is used as talking_photo_id for v2 generation
-                        "talking_photo_id": image_key,
+                        "talking_photo_id": talking_photo_id,
                         "use_avatar_iv_model": True,
                         "super_resolution": request.super_resolution if request.super_resolution is not None else True
                     },
@@ -1628,6 +1697,7 @@ async def heygen_avatar_iv(
             "implementation": {
                 "endpoint": "https://api.heygen.com/v2/video/generate",
                 "avatar_iv_enabled": True,
+                    "talking_photo_id": talking_photo_id,
                 "super_resolution_enabled": request.super_resolution if request.super_resolution is not None else True,
                 "ignored_legacy_fields_if_provided": [
                     "fit",
