@@ -89,7 +89,7 @@ class ElevenLabsSpeechRequest(BaseModel):
 class HeyGenAvatarIVRequest(BaseModel):
     """
     Request model for HeyGen Avatar IV video generation.
-    Based on: https://docs.heygen.com/reference/create-avatar-iv-video
+    Based on: https://docs.heygen.com/reference/create-an-avatar-video-v2
     
     Note: Instead of image_key, this endpoint accepts image_url which will be 
     automatically uploaded to HeyGen using their Upload Asset API.
@@ -108,6 +108,7 @@ class HeyGenAvatarIVRequest(BaseModel):
     enhance_custom_motion_prompt: Optional[bool] = None  # Whether to enhance the custom motion prompt with AI
     audio_url: Optional[str] = None  # URL of an audio file to use instead of TTS
     audio_asset_id: Optional[str] = None  # Asset ID of a previously uploaded audio file
+    super_resolution: Optional[bool] = True  # Enhance talking photo image quality
 
 class GoogleDriveToS3Request(BaseModel):
     """
@@ -1403,7 +1404,7 @@ async def heygen_avatar_iv(
     x_api_key: str = Header(..., alias="X-Api-Key")
 ):
     """
-    Generate an Avatar IV video using HeyGen's API.
+    Generate an Avatar IV video using HeyGen's v2/video/generate API.
     
     This endpoint:
     1. Takes a publicly accessible image URL
@@ -1413,7 +1414,7 @@ async def heygen_avatar_iv(
     
     HeyGen API Documentation:
     - Upload Asset: https://docs.heygen.com/reference/upload-asset
-    - Create Avatar IV Video: https://docs.heygen.com/reference/create-avatar-iv-video
+    - Create a Video (V2): https://docs.heygen.com/reference/create-an-avatar-video-v2
     
     Args:
         request: HeyGenAvatarIVRequest containing:
@@ -1430,11 +1431,30 @@ async def heygen_avatar_iv(
         x_api_key: HeyGen API key passed via X-Api-Key header
     
     Returns:
-        JSON response from HeyGen's Create Avatar IV Video API
+        JSON response from HeyGen's Create a Video (V2) API
     """
     logger.info(f"HeyGen Avatar IV request received - Image URL: {request.image_url}, Script: {'Yes' if request.script else 'No'}, Audio URL: {'Yes' if request.audio_url else 'No'}")
     
     try:
+        # Validate voice input mode:
+        # Mode A (text): script + voice_id
+        # Mode B (audio): audio_url xor audio_asset_id
+        has_text_mode = bool(request.script and request.voice_id)
+        has_audio_url = bool(request.audio_url)
+        has_audio_asset_id = bool(request.audio_asset_id)
+        has_audio_mode = has_audio_url or has_audio_asset_id
+
+        if not has_text_mode and not has_audio_mode:
+            raise HTTPException(
+                status_code=400,
+                detail="Provide either (script + voice_id) for text mode OR (audio_url or audio_asset_id) for audio mode"
+            )
+        if has_audio_url and has_audio_asset_id:
+            raise HTTPException(
+                status_code=400,
+                detail="Provide only one of audio_url or audio_asset_id"
+            )
+
         # Step 1: Download the image from the provided URL
         logger.info(f"Downloading image from URL: {request.image_url}")
         
@@ -1533,41 +1553,55 @@ async def heygen_avatar_iv(
         
         logger.info(f"Image uploaded to HeyGen successfully. Image key: {image_key}")
         
-        # Step 3: Generate the Avatar IV video
-        logger.info("Generating Avatar IV video...")
+        # Step 3: Generate video using HeyGen v2 endpoint
+        logger.info("Generating Avatar IV video via v2/video/generate...")
         
-        generate_url = "https://api.heygen.com/v2/video/av4/generate"
+        generate_url = "https://api.heygen.com/v2/video/generate"
         generate_headers = {
             "X-Api-Key": x_api_key,
             "Content-Type": "application/json"
         }
-        
-        # Build the request payload with image_key (required)
+
+        # Build voice object for v2 schema
+        if has_text_mode:
+            voice_object = {
+                "type": "text",
+                "voice_id": request.voice_id,
+                "input_text": request.script
+            }
+        else:
+            voice_object = {"type": "audio"}
+            if request.audio_url is not None:
+                voice_object["audio_url"] = request.audio_url
+            if request.audio_asset_id is not None:
+                voice_object["audio_asset_id"] = request.audio_asset_id
+
+        # Core v2 payload
         generate_payload = {
-            "image_key": image_key
+            "title": request.video_title or "Avatar IV Video",
+            "video_inputs": [
+                {
+                    "character": {
+                        "type": "talking_photo",
+                        # image_key returned by upload endpoint is used as talking_photo_id for v2 generation
+                        "talking_photo_id": image_key,
+                        "use_avatar_iv_model": True,
+                        "super_resolution": request.super_resolution if request.super_resolution is not None else True
+                    },
+                    "voice": voice_object
+                }
+            ]
         }
-        
-        # Add TTS parameters if provided (script and voice_id)
-        if request.script is not None:
-            generate_payload["script"] = request.script
-        if request.voice_id is not None:
-            generate_payload["voice_id"] = request.voice_id
-        
-        # Add optional parameters if provided
-        if request.video_title is not None:
-            generate_payload["video_title"] = request.video_title
-        if request.video_orientation is not None:
-            generate_payload["video_orientation"] = request.video_orientation
-        if request.fit is not None:
-            generate_payload["fit"] = request.fit
-        if request.custom_motion_prompt is not None:
-            generate_payload["custom_motion_prompt"] = request.custom_motion_prompt
-        if request.enhance_custom_motion_prompt is not None:
-            generate_payload["enhance_custom_motion_prompt"] = request.enhance_custom_motion_prompt
-        if request.audio_url is not None:
-            generate_payload["audio_url"] = request.audio_url
-        if request.audio_asset_id is not None:
-            generate_payload["audio_asset_id"] = request.audio_asset_id
+
+        # Optional output dimensions derived from old orientation field
+        if request.video_orientation:
+            orientation = request.video_orientation.lower()
+            if orientation == "portrait":
+                generate_payload["dimension"] = {"width": 1080, "height": 1920}
+            elif orientation == "square":
+                generate_payload["dimension"] = {"width": 1080, "height": 1080}
+            elif orientation == "landscape":
+                generate_payload["dimension"] = {"width": 1920, "height": 1080}
         
         logger.info(f"Calling HeyGen Avatar IV API with payload: {generate_payload}")
         
@@ -1579,17 +1613,29 @@ async def heygen_avatar_iv(
         )
         
         if generate_response.status_code != 200:
-            logger.error(f"HeyGen Avatar IV generation failed: {generate_response.status_code} - {generate_response.text}")
+            logger.error(f"HeyGen v2 video generation failed: {generate_response.status_code} - {generate_response.text}")
             raise HTTPException(
                 status_code=generate_response.status_code,
-                detail=f"Failed to generate Avatar IV video: {generate_response.text}"
+                detail=f"Failed to generate HeyGen video (v2): {generate_response.text}"
             )
         
         heygen_response = generate_response.json()
-        logger.info(f"HeyGen Avatar IV video generation initiated successfully: {heygen_response}")
+        logger.info(f"HeyGen v2 video generation initiated successfully: {heygen_response}")
         
-        # Return the HeyGen response directly
-        return JSONResponse(status_code=200, content=heygen_response)
+        # Return HeyGen response with compatibility notes
+        return JSONResponse(status_code=200, content={
+            **heygen_response,
+            "implementation": {
+                "endpoint": "https://api.heygen.com/v2/video/generate",
+                "avatar_iv_enabled": True,
+                "super_resolution_enabled": request.super_resolution if request.super_resolution is not None else True,
+                "ignored_legacy_fields_if_provided": [
+                    "fit",
+                    "custom_motion_prompt",
+                    "enhance_custom_motion_prompt"
+                ]
+            }
+        })
     
     except requests.exceptions.RequestException as e:
         logger.error(f"Request error during HeyGen API call: {str(e)}")
