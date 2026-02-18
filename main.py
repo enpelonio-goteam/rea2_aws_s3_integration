@@ -1626,76 +1626,6 @@ async def heygen_avatar_iv(
                 detail=f"Timed out waiting for HeyGen talking photo to be ready. look_id: {talking_photo_id}, last_status: {look_status}"
             )
 
-        selected_talking_photo_id = talking_photo_id
-        applied_motion_type = None
-
-        # Step 4.5: Optional motion generation using the new Add Motion API.
-        # This is the replacement for legacy custom_motion_prompt behavior.
-        if request.custom_motion_prompt:
-            logger.info("Applying custom motion prompt via HeyGen add_motion API...")
-            applied_motion_type = "expressive" if request.enhance_custom_motion_prompt else "consistent"
-            add_motion_url = "https://api.heygen.com/v2/photo_avatar/add_motion"
-            add_motion_payload = {
-                "id": talking_photo_id,
-                "prompt": request.custom_motion_prompt,
-                "motion_type": applied_motion_type
-            }
-
-            add_motion_response = requests.post(
-                add_motion_url,
-                headers=heygen_json_headers,
-                json=add_motion_payload,
-                timeout=120
-            )
-
-            if add_motion_response.status_code != 200:
-                logger.error(f"HeyGen add_motion failed: {add_motion_response.status_code} - {add_motion_response.text}")
-                raise HTTPException(
-                    status_code=add_motion_response.status_code,
-                    detail=f"Failed to apply HeyGen motion prompt: {add_motion_response.text}"
-                )
-
-            add_motion_data = add_motion_response.json()
-            motion_id = (add_motion_data.get("data") or {}).get("id")
-            if not motion_id:
-                logger.error(f"Could not extract motion id from add_motion response: {add_motion_data}")
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"Could not extract motion id from HeyGen add_motion response: {add_motion_data}"
-                )
-
-            logger.info(f"Motion look created: {motion_id}. Polling until ready...")
-            motion_details_url = f"https://api.heygen.com/v2/photo_avatar/{motion_id}"
-            motion_status = None
-            for _ in range(max_polls):
-                motion_details_response = requests.get(motion_details_url, headers={"X-Api-Key": x_api_key}, timeout=60)
-                if motion_details_response.status_code != 200:
-                    logger.warning(f"HeyGen motion status poll failed: {motion_details_response.status_code} - {motion_details_response.text}")
-                    time.sleep(poll_interval_seconds)
-                    continue
-
-                motion_details_data = motion_details_response.json()
-                motion_status = ((motion_details_data.get("data") or {}).get("status") or "").lower()
-                if motion_status == "completed":
-                    selected_talking_photo_id = motion_id
-                    logger.info(f"HeyGen motion look is ready: {selected_talking_photo_id}")
-                    break
-                if motion_status in {"moderation_rejected", "in_appeal", "failed"}:
-                    logger.error(f"HeyGen motion look not usable. Status: {motion_status}, details: {motion_details_data}")
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"HeyGen motion look status is '{motion_status}'. Details: {motion_details_data}"
-                    )
-
-                time.sleep(poll_interval_seconds)
-
-            if motion_status != "completed":
-                logger.error(f"Timed out waiting for HeyGen motion look readiness. Last status: {motion_status}, look_id: {motion_id}")
-                raise HTTPException(
-                    status_code=504,
-                    detail=f"Timed out waiting for HeyGen motion look to be ready. look_id: {motion_id}, last_status: {motion_status}"
-                )
-        
         # Step 5: Generate video using HeyGen v2 endpoint
         logger.info("Generating Avatar IV video via v2/video/generate...")
         
@@ -1723,7 +1653,8 @@ async def heygen_avatar_iv(
                 {
                     "character": {
                         "type": "talking_photo",
-                        "talking_photo_id": selected_talking_photo_id,
+                        "talking_photo_id": talking_photo_id,
+                        "talking_style": "expressive",
                         "use_avatar_iv_model": True,
                         "super_resolution": request.super_resolution if request.super_resolution is not None else True
                     },
@@ -1767,14 +1698,12 @@ async def heygen_avatar_iv(
             "implementation": {
                 "endpoint": "https://api.heygen.com/v2/video/generate",
                 "avatar_iv_enabled": True,
-                "talking_photo_id": selected_talking_photo_id,
-                "base_talking_photo_id": talking_photo_id,
-                "motion_applied": bool(request.custom_motion_prompt),
-                "motion_type": applied_motion_type,
+                "talking_photo_id": talking_photo_id,
+                "talking_style": "expressive",
                 "super_resolution_enabled": request.super_resolution if request.super_resolution is not None else True,
                 "ignored_legacy_fields_if_provided": [
                     "fit",
-                    # legacy enhance flag now maps to motion_type
+                    "custom_motion_prompt",
                     "enhance_custom_motion_prompt"
                 ]
             }
