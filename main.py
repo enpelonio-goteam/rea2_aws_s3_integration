@@ -2071,6 +2071,7 @@ async def google_drive_to_s3(request: GoogleDriveToS3Request):
                         'image/png': '.png',
                         'image/gif': '.gif',
                         'image/webp': '.webp',
+                        'image/svg+xml': '.svg',
                         'video/mp4': '.mp4',
                         'video/webm': '.webm',
                         'video/quicktime': '.mov',
@@ -2094,6 +2095,12 @@ async def google_drive_to_s3(request: GoogleDriveToS3Request):
                     raise Exception("Downloaded file is empty")
                 
                 logger.info(f"File downloaded successfully. Size: {content_length} bytes ({content_length / (1024*1024):.2f} MB)")
+
+                # Google Drive may return a generic/incorrect Content-Type for SVG files.
+                # Trust the filename extension for SVG and force the correct MIME type.
+                if filename and filename.lower().endswith('.svg'):
+                    content_type = 'image/svg+xml'
+                    logger.info("Overriding Content-Type to image/svg+xml based on .svg filename")
                 
                 # Success - break out of retry loop
                 break
@@ -2128,6 +2135,7 @@ async def google_drive_to_s3(request: GoogleDriveToS3Request):
             Key=s3_key,
             Body=file_content,
             ContentType=content_type,
+            ContentDisposition="inline",
             ACL='public-read'
         )
         
