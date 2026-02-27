@@ -1999,16 +1999,47 @@ async def google_drive_to_s3(request: GoogleDriveToS3Request):
                     
                     # Look for the confirmation token in the response
                     html_content = response.text
-                    
-                    # Look for confirm parameter in various formats
-                    confirm_match = re.search(r'confirm=([0-9A-Za-z_-]+)', html_content)
-                    if confirm_match:
-                        confirm_token = confirm_match.group(1)
-                        logger.info(f"Found confirmation token: {confirm_token}")
-                        
-                        # Make the confirmed download request
-                        confirmed_url = f"https://drive.google.com/uc?export=download&id={file_id}&confirm={confirm_token}"
-                        response = session.get(
+
+                    # Collect possible confirmation tokens from modern/legacy Google Drive pages.
+                    confirm_candidates = []
+
+                    # Pattern 1: URL parameter style (e.g. ...&confirm=xxxx...)
+                    confirm_param_matches = re.findall(r'[?&]confirm=([0-9A-Za-z_-]+)', html_content)
+                    confirm_candidates.extend(confirm_param_matches)
+
+                    # Pattern 2: hidden input style (e.g. <input name="confirm" value="t">)
+                    confirm_input_matches = re.findall(r'name=["\']confirm["\']\s+value=["\']([0-9A-Za-z_-]+)["\']', html_content)
+                    confirm_candidates.extend(confirm_input_matches)
+
+                    # Pattern 3: download warning cookie set by Drive
+                    for cookie_name, cookie_value in session.cookies.items():
+                        if cookie_name.startswith("download_warning") and cookie_value:
+                            confirm_candidates.append(cookie_value)
+
+                    # De-duplicate while preserving order
+                    unique_confirm_candidates = list(dict.fromkeys(confirm_candidates))
+
+                    # Build fallback URLs:
+                    # - try explicit tokens first
+                    # - then common fallback token 't'
+                    # - then modern driveusercontent endpoint
+                    confirmation_urls = [
+                        f"https://drive.google.com/uc?export=download&id={file_id}&confirm={token}"
+                        for token in unique_confirm_candidates
+                    ]
+                    confirmation_urls.append(f"https://drive.google.com/uc?export=download&id={file_id}&confirm=t")
+                    confirmation_urls.append(f"https://drive.usercontent.google.com/download?id={file_id}&export=download&confirm=t")
+
+                    if unique_confirm_candidates:
+                        logger.info(f"Found {len(unique_confirm_candidates)} confirmation token candidate(s)")
+                    else:
+                        logger.warning("No explicit confirmation token found; trying fallback confirmation URLs")
+
+                    # Try each confirmation URL until we get non-HTML content
+                    confirmed_response = None
+                    for confirmed_url in confirmation_urls:
+                        logger.info(f"Trying confirmation URL: {confirmed_url}")
+                        candidate_response = session.get(
                             confirmed_url,
                             stream=True,
                             timeout=300,  # 5 minutes for large files
@@ -2016,24 +2047,18 @@ async def google_drive_to_s3(request: GoogleDriveToS3Request):
                                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
                             }
                         )
-                        response.raise_for_status()
+                        candidate_response.raise_for_status()
+
+                        candidate_content_type = candidate_response.headers.get('Content-Type', '')
+                        if 'text/html' not in candidate_content_type:
+                            confirmed_response = candidate_response
+                            logger.info("Confirmation URL returned downloadable content")
+                            break
+
+                    if confirmed_response is not None:
+                        response = confirmed_response
                     else:
-                        # Try alternative confirmation approach - look for uuid
-                        uuid_match = re.search(r'uuid=([0-9A-Za-z_-]+)', html_content)
-                        if uuid_match:
-                            # Use the download_warning cookie approach
-                            confirmed_url = f"https://drive.google.com/uc?export=download&id={file_id}&confirm=t"
-                            response = session.get(
-                                confirmed_url,
-                                stream=True,
-                                timeout=300,
-                                headers={
-                                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-                                }
-                            )
-                            response.raise_for_status()
-                        else:
-                            logger.warning("Could not find confirmation token, file may not be downloadable")
+                        logger.warning("All confirmation URL attempts returned HTML")
                 
                 # Check content type again after potential redirect
                 content_type_header = response.headers.get('Content-Type', 'application/octet-stream')
