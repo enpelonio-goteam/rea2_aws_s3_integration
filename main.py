@@ -2136,6 +2136,7 @@ async def google_drive_to_s3(request: GoogleDriveToS3Request):
             Body=file_content,
             ContentType=content_type,
             ContentDisposition="inline",
+            Tagging="temporary=true",
             ACL='public-read'
         )
         
