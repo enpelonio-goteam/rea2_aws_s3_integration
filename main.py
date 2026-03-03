@@ -134,6 +134,12 @@ class AnalyzeImagesRequest(BaseModel):
     model: str
     reasoning_effort: Optional[str] = "none"
 
+class OptimizeImageToS3Request(BaseModel):
+    image_url: str  # Publicly accessible image URL
+    filename: Optional[str] = None  # Optional output filename
+    output_folder: Optional[str] = "optimized-images"  # S3 folder prefix for uploads
+    max_size_mb: Optional[float] = 20.0  # Max allowed image size in MB
+
 app = FastAPI(title="Logic Provider Functions", version="1.0.0")
 
 # AWS S3 configuration
@@ -180,7 +186,7 @@ async def root():
     return {
         "message": "Logic Provider Functions API", 
         "status": "running",
-        "endpoints": ["/upload-html", "/generate-image", "/html-to-image", "/process-loom-video", "/upload-linkedin-video", "/url-to-google-drive", "/eleven-labs-speech", "/heygen-avatar-iv", "/google-drive-to-s3", "/telegram-file/bot{BotToken}/{file_path}", "/transcribe-audio", "/analyze-images", "/health"],
+        "endpoints": ["/upload-html", "/generate-image", "/html-to-image", "/optimize-image-to-s3", "/process-loom-video", "/upload-linkedin-video", "/url-to-google-drive", "/eleven-labs-speech", "/heygen-avatar-iv", "/google-drive-to-s3", "/telegram-file/bot{BotToken}/{file_path}", "/transcribe-audio", "/analyze-images", "/health"],
         "aws_configured": bool(AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY and S3_BUCKET_NAME),
         "timestamp": datetime.now().isoformat()
     }
@@ -739,6 +745,245 @@ async def html_to_image(request: HTMLToImageRequest):
         raise HTTPException(
             status_code=500,
             detail=f"Failed to convert HTML to image: {str(e)}"
+        )
+
+@app.post("/optimize-image-to-s3")
+async def optimize_image_to_s3(request: OptimizeImageToS3Request):
+    """
+    Download a public image URL and ensure uploaded size is <= max_size_mb.
+    If the source image is already under the limit, upload as-is.
+    If it exceeds the limit, compress/resize and upload the optimized image.
+    """
+    logger.info(f"Optimize image request received - URL: {request.image_url}")
+
+    try:
+        # Validate required AWS environment variables
+        if not all([AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, S3_BUCKET_NAME]):
+            logger.error("Missing required AWS environment variables")
+            raise HTTPException(
+                status_code=500,
+                detail="AWS credentials or bucket name not configured"
+            )
+
+        if not s3_client:
+            logger.error("S3 client not initialized")
+            raise HTTPException(
+                status_code=500,
+                detail="S3 client not available - check AWS configuration"
+            )
+
+        max_size_mb = request.max_size_mb if request.max_size_mb and request.max_size_mb > 0 else 20.0
+        max_size_bytes = int(max_size_mb * 1024 * 1024)
+
+        # Step 1: Download image from public URL
+        logger.info("Downloading image from URL...")
+        response = requests.get(
+            request.image_url,
+            timeout=120,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            }
+        )
+        response.raise_for_status()
+
+        original_bytes = response.content
+        original_size_bytes = len(original_bytes)
+        if original_size_bytes == 0:
+            raise HTTPException(status_code=400, detail="Downloaded image is empty")
+
+        source_content_type = response.headers.get("Content-Type", "application/octet-stream")
+        if ";" in source_content_type:
+            source_content_type = source_content_type.split(";")[0].strip()
+
+        logger.info(
+            f"Downloaded image size: {original_size_bytes} bytes ({original_size_bytes / (1024 * 1024):.2f} MB), Content-Type: {source_content_type}"
+        )
+
+        # Step 2: Resolve output filename
+        filename = request.filename
+        if not filename:
+            content_disposition = response.headers.get("Content-Disposition", "")
+            if "filename=" in content_disposition:
+                match = re.search(r'filename\*?=["\']?(?:UTF-8\'\')?([^"\';\s]+)["\']?', content_disposition)
+                if match:
+                    filename = unquote(match.group(1))
+
+        if not filename:
+            parsed = urlparse(request.image_url)
+            path_filename = unquote(parsed.path.split("/")[-1]) if parsed.path else ""
+            if path_filename:
+                filename = path_filename
+
+        if not filename:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            unique_id = str(uuid.uuid4())[:8]
+            extension_map = {
+                "image/jpeg": ".jpg",
+                "image/png": ".png",
+                "image/webp": ".webp",
+                "image/gif": ".gif",
+                "image/svg+xml": ".svg",
+                "image/bmp": ".bmp",
+                "image/tiff": ".tiff",
+            }
+            extension = extension_map.get(source_content_type, ".jpg")
+            filename = f"image_{timestamp}_{unique_id}{extension}"
+
+        # Basic filename safety: avoid writing nested key paths via filename input.
+        filename = filename.replace("\\", "/").split("/")[-1]
+
+        # Normalize folder path
+        output_folder = (request.output_folder or "optimized-images").strip("/")
+        if not output_folder:
+            output_folder = "optimized-images"
+
+        is_svg = source_content_type == "image/svg+xml" or filename.lower().endswith(".svg")
+        upload_bytes = original_bytes
+        upload_content_type = source_content_type
+        was_compressed = False
+
+        # Step 3: If over max size, compress/resize for raster images.
+        if original_size_bytes > max_size_bytes:
+            if is_svg:
+                raise HTTPException(
+                    status_code=400,
+                    detail="SVG image is larger than the max size and cannot be resized by this endpoint"
+                )
+
+            try:
+                image = Image.open(BytesIO(original_bytes))
+                image.load()
+            except Exception as image_error:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Downloaded file is not a valid processable image: {str(image_error)}"
+                )
+
+            # Convert to RGB for JPEG encoding (flatten transparency onto white if needed).
+            if image.mode in ("RGBA", "LA", "P"):
+                rgba_image = image.convert("RGBA")
+                background = Image.new("RGBA", rgba_image.size, (255, 255, 255, 255))
+                image = Image.alpha_composite(background, rgba_image).convert("RGB")
+            else:
+                image = image.convert("RGB")
+
+            resample_filter = Image.Resampling.LANCZOS if hasattr(Image, "Resampling") else Image.LANCZOS
+            quality = 92
+            resize_ratio = 1.0
+            best_result = None
+
+            for _ in range(14):
+                working_image = image
+                if resize_ratio < 1.0:
+                    new_width = max(1, int(image.width * resize_ratio))
+                    new_height = max(1, int(image.height * resize_ratio))
+                    working_image = image.resize((new_width, new_height), resample_filter)
+
+                output_buffer = BytesIO()
+                working_image.save(
+                    output_buffer,
+                    format="JPEG",
+                    quality=quality,
+                    optimize=True,
+                    progressive=True
+                )
+                candidate_bytes = output_buffer.getvalue()
+                best_result = candidate_bytes
+
+                if len(candidate_bytes) <= max_size_bytes:
+                    break
+
+                if quality > 45:
+                    quality -= 10
+                else:
+                    resize_ratio *= 0.85
+
+            if not best_result or len(best_result) > max_size_bytes:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Unable to reduce image below {max_size_mb} MB"
+                )
+
+            base_name, _ = os.path.splitext(filename)
+            filename = f"{base_name}_optimized.jpg"
+            upload_bytes = best_result
+            upload_content_type = "image/jpeg"
+            was_compressed = True
+        else:
+            # Validate non-SVG images are processable image files.
+            if not is_svg:
+                try:
+                    image = Image.open(BytesIO(original_bytes))
+                    image.load()
+                except Exception as image_error:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Downloaded file is not a valid image: {str(image_error)}"
+                    )
+
+        # If no extension is present, infer one from upload content type.
+        if "." not in filename:
+            extension_map = {
+                "image/jpeg": ".jpg",
+                "image/png": ".png",
+                "image/webp": ".webp",
+                "image/gif": ".gif",
+                "image/svg+xml": ".svg",
+                "image/bmp": ".bmp",
+                "image/tiff": ".tiff",
+            }
+            filename += extension_map.get(upload_content_type, ".jpg")
+
+        s3_key = f"{output_folder}/{filename}"
+        logger.info(f"Uploading optimized image to S3 - Bucket: {S3_BUCKET_NAME}, Key: {s3_key}")
+
+        # Step 4: Upload to S3
+        s3_client.put_object(
+            Bucket=S3_BUCKET_NAME,
+            Key=s3_key,
+            Body=upload_bytes,
+            ContentType=upload_content_type,
+            ContentDisposition="inline",
+            Tagging="temporary=true",
+            ACL='public-read'
+        )
+
+        public_url = f"https://{S3_BUCKET_NAME}.s3.{AWS_REGION}.amazonaws.com/{s3_key}"
+        final_size_bytes = len(upload_bytes)
+        logger.info(
+            f"Image upload complete. Final size: {final_size_bytes} bytes ({final_size_bytes / (1024 * 1024):.2f} MB)"
+        )
+
+        response_data = {
+            "success": True,
+            "message": "Image uploaded successfully (optimized only when required)",
+            "source_url": request.image_url,
+            "public_url": public_url,
+            "s3_key": s3_key,
+            "filename": filename,
+            "folder_path": output_folder,
+            "max_size_mb": max_size_mb,
+            "original_size_bytes": original_size_bytes,
+            "final_size_bytes": final_size_bytes,
+            "was_compressed": was_compressed,
+            "content_type": upload_content_type,
+            "uploaded_at": datetime.now().isoformat()
+        }
+        return JSONResponse(status_code=200, content=response_data)
+
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Failed to download image from URL: {str(e)}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Failed to download image from URL: {str(e)}"
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error during image optimization: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to optimize and upload image: {str(e)}"
         )
 
 @app.post("/upload-linkedin-video")
