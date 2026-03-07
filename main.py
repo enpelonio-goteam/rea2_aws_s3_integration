@@ -944,7 +944,6 @@ async def optimize_image_to_s3(request: OptimizeImageToS3Request):
             Body=upload_bytes,
             ContentType=upload_content_type,
             ContentDisposition="inline",
-            Tagging="temporary=true",
             ACL='public-read'
         )
 
