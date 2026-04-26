@@ -140,6 +140,10 @@ class OptimizeImageToS3Request(BaseModel):
     output_folder: Optional[str] = "optimized-images"  # S3 folder prefix for uploads
     max_size_mb: Optional[float] = 20.0  # Max allowed image size in MB
 
+class MarkdownToDocxRequest(BaseModel):
+    text: str  # Markdown text to convert
+    filename: Optional[str] = None  # Optional output filename (without extension)
+
 app = FastAPI(title="Logic Provider Functions", version="1.0.0")
 
 # AWS S3 configuration
@@ -186,7 +190,7 @@ async def root():
     return {
         "message": "Logic Provider Functions API", 
         "status": "running",
-        "endpoints": ["/upload-html", "/generate-image", "/html-to-image", "/optimize-image-to-s3", "/process-loom-video", "/upload-linkedin-video", "/url-to-google-drive", "/eleven-labs-speech", "/heygen-avatar-iv", "/google-drive-to-s3", "/telegram-file/bot{BotToken}/{file_path}", "/transcribe-audio", "/analyze-images", "/health"],
+        "endpoints": ["/upload-html", "/generate-image", "/html-to-image", "/optimize-image-to-s3", "/process-loom-video", "/upload-linkedin-video", "/url-to-google-drive", "/eleven-labs-speech", "/heygen-avatar-iv", "/google-drive-to-s3", "/telegram-file/bot{BotToken}/{file_path}", "/transcribe-audio", "/analyze-images", "/markdown-to-docx", "/health"],
         "aws_configured": bool(AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY and S3_BUCKET_NAME),
         "timestamp": datetime.now().isoformat()
     }
@@ -2840,6 +2844,193 @@ async def analyze_images(
             status_code=500,
             detail=f"Failed to analyze images: {str(e)}"
         )
+
+@app.post("/markdown-to-docx")
+async def markdown_to_docx(request: MarkdownToDocxRequest):
+    """
+    Convert markdown text to a .docx Word document and upload to S3 under documents/.
+
+    Supports headers (h1-h6), paragraphs, bold/italic/inline-code, links,
+    ordered/unordered lists, tables, blockquotes, code blocks, and horizontal rules.
+    """
+    logger.info(f"Markdown-to-docx request - filename: {request.filename}, length: {len(request.text)}")
+
+    try:
+        import markdown as md_lib
+        from bs4 import BeautifulSoup, NavigableString
+        from docx import Document
+        from docx.shared import Pt, RGBColor
+        from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+        if not all([AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, S3_BUCKET_NAME]) or not s3_client:
+            raise HTTPException(status_code=500, detail="AWS/S3 not configured")
+
+        # 1. Markdown -> HTML
+        html = md_lib.markdown(
+            request.text,
+            extensions=["tables", "fenced_code", "nl2br", "sane_lists"],
+        )
+        soup = BeautifulSoup(f"<div>{html}</div>", "html.parser")
+
+        # 2. Build the docx
+        doc = Document()
+        style = doc.styles["Normal"]
+        style.font.name = "Calibri"
+        style.font.size = Pt(11)
+
+        def add_inline(paragraph, node, bold=False, italic=False, code=False, link=None):
+            """Recursively add inline runs to a paragraph."""
+            if isinstance(node, NavigableString):
+                text = str(node)
+                if not text:
+                    return
+                run = paragraph.add_run(text)
+                run.bold = bold
+                run.italic = italic
+                if code:
+                    run.font.name = "Consolas"
+                if link:
+                    run.font.color.rgb = RGBColor(0x1A, 0x73, 0xE8)
+                    run.underline = True
+                return
+
+            name = node.name
+            new_bold = bold or name in ("strong", "b")
+            new_italic = italic or name in ("em", "i")
+            new_code = code or name == "code"
+            new_link = link or (node.get("href") if name == "a" else None)
+
+            if name == "br":
+                paragraph.add_run().add_break()
+                return
+
+            for child in node.children:
+                add_inline(paragraph, child, new_bold, new_italic, new_code, new_link)
+
+        def add_list(list_node, ordered, level=0):
+            style_name = "List Number" if ordered else "List Bullet"
+            for li in list_node.find_all("li", recursive=False):
+                p = doc.add_paragraph(style=style_name)
+                p.paragraph_format.left_indent = Pt(18 * (level + 1))
+                # Inline content of the <li>, excluding nested lists
+                for child in li.children:
+                    if getattr(child, "name", None) in ("ul", "ol"):
+                        continue
+                    add_inline(p, child)
+                # Recurse into nested lists
+                for nested in li.find_all(["ul", "ol"], recursive=False):
+                    add_list(nested, nested.name == "ol", level + 1)
+
+        def add_table(table_node):
+            rows = table_node.find_all("tr")
+            if not rows:
+                return
+            cols = max(len(r.find_all(["td", "th"])) for r in rows)
+            tbl = doc.add_table(rows=len(rows), cols=cols)
+            tbl.style = "Light Grid Accent 1"
+            for r_idx, tr in enumerate(rows):
+                cells = tr.find_all(["td", "th"])
+                for c_idx, cell in enumerate(cells):
+                    docx_cell = tbl.rows[r_idx].cells[c_idx]
+                    docx_cell.text = ""
+                    p = docx_cell.paragraphs[0]
+                    is_header = cell.name == "th"
+                    for child in cell.children:
+                        add_inline(p, child, bold=is_header)
+
+        root = soup.find("div")
+        for el in root.children:
+            if isinstance(el, NavigableString):
+                txt = str(el).strip()
+                if txt:
+                    doc.add_paragraph(txt)
+                continue
+
+            tag = el.name
+            if tag in ("h1", "h2", "h3", "h4", "h5", "h6"):
+                level = int(tag[1])
+                p = doc.add_heading(level=level if level <= 9 else 9)
+                for child in el.children:
+                    add_inline(p, child)
+            elif tag == "p":
+                p = doc.add_paragraph()
+                for child in el.children:
+                    add_inline(p, child)
+            elif tag == "ul":
+                add_list(el, ordered=False)
+            elif tag == "ol":
+                add_list(el, ordered=True)
+            elif tag == "table":
+                add_table(el)
+            elif tag == "blockquote":
+                for child_p in el.find_all("p"):
+                    p = doc.add_paragraph(style="Intense Quote")
+                    for child in child_p.children:
+                        add_inline(p, child)
+            elif tag == "pre":
+                code_text = el.get_text()
+                p = doc.add_paragraph()
+                run = p.add_run(code_text)
+                run.font.name = "Consolas"
+                run.font.size = Pt(10)
+            elif tag == "hr":
+                doc.add_paragraph("_" * 50).alignment = WD_ALIGN_PARAGRAPH.CENTER
+            else:
+                p = doc.add_paragraph()
+                for child in el.children:
+                    add_inline(p, child)
+
+        # 3. Serialize to bytes
+        buffer = io.BytesIO()
+        doc.save(buffer)
+        buffer.seek(0)
+        docx_bytes = buffer.getvalue()
+
+        # 4. Build S3 key under documents/
+        if request.filename:
+            base = request.filename
+            if base.endswith(".docx"):
+                base = base[:-5]
+            base = base.lstrip("/")
+            if base.startswith("documents/"):
+                base = base[len("documents/"):]
+            key = f"documents/{base}.docx"
+        else:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            unique_id = str(uuid.uuid4())[:8]
+            key = f"documents/markdown_{timestamp}_{unique_id}.docx"
+
+        s3_client.put_object(
+            Bucket=S3_BUCKET_NAME,
+            Key=key,
+            Body=docx_bytes,
+            ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            ACL="public-read",
+        )
+
+        public_url = f"https://{S3_BUCKET_NAME}.s3.{AWS_REGION}.amazonaws.com/{key}"
+        logger.info(f"Uploaded docx to S3: {key}")
+
+        return JSONResponse(
+            status_code=200,
+            content={
+                "success": True,
+                "message": "Markdown converted and uploaded successfully",
+                "filename": key,
+                "public_url": public_url,
+                "bucket": S3_BUCKET_NAME,
+                "region": AWS_REGION,
+                "key": key,
+                "size_bytes": len(docx_bytes),
+                "uploaded_at": datetime.now().isoformat(),
+            },
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error converting markdown to docx: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to convert markdown: {str(e)}")
 
 @app.get("/health")
 async def health_check():
