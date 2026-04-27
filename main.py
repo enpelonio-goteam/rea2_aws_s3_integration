@@ -3077,41 +3077,149 @@ async def upload_to_sharepoint(
     auth_headers = {"Authorization": f"Bearer {access_token}"}
 
     try:
-        # 1. Encode SharePoint sharing URL into a Graph share ID.
-        #    Format: "u!" + base64url(url) without padding.
+        drive_id = None
+        folder_id = None
+
+        # 1a. Try resolving as a Graph sharing link first (works for real
+        #     "Share -> Copy link" URLs of the form .../:f:/s/...).
         share_b64 = (
             base64.urlsafe_b64encode(request.sharepoint_url.encode("utf-8"))
             .decode("ascii")
             .rstrip("=")
         )
         share_id = f"u!{share_b64}"
-
-        # 2. Resolve the share to a driveItem (the destination folder).
         share_resp = requests.get(
             f"{GRAPH}/shares/{share_id}/driveItem",
             headers=auth_headers,
             timeout=30,
         )
-        if share_resp.status_code != 200:
-            logger.error(
-                f"Failed to resolve share URL: {share_resp.status_code} {share_resp.text}"
+
+        if share_resp.status_code == 200:
+            share_item = share_resp.json()
+            parent_ref = share_item.get("parentReference", {})
+            drive_id = parent_ref.get("driveId")
+            folder_id = share_item.get("id")
+            if "folder" not in share_item:
+                logger.warning(
+                    "Resolved share item is not a folder; uploading alongside it in its parent"
+                )
+        else:
+            # 1b. Fall back to parsing the URL as a SharePoint path.
+            #     Handles browser-copied URLs like:
+            #       https://{host}/:f:/r/sites/{site}/{library}/{folder/path}?...
+            #       https://{host}/sites/{site}/{library}/{folder/path}
+            logger.info(
+                f"/shares lookup failed ({share_resp.status_code}); "
+                f"falling back to path parsing"
             )
-            raise HTTPException(
-                status_code=share_resp.status_code if share_resp.status_code in (401, 403, 404) else 502,
-                detail=f"Failed to resolve SharePoint share URL: {share_resp.text}",
+            parsed = urlparse(request.sharepoint_url)
+            hostname = parsed.netloc
+            path = unquote(parsed.path).lstrip("/")
+            # Strip ":<x>:/<y>/" prefix if present (e.g. ":f:/r/", ":w:/r/")
+            path = re.sub(r"^:[a-z]:/[a-z]/", "", path)
+            parts = [p for p in path.split("/") if p]
+            if len(parts) < 2 or parts[0] not in ("sites", "teams"):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Could not parse SharePoint URL. Expected a path containing "
+                        f"'sites/<name>' or 'teams/<name>'. Got: {request.sharepoint_url}"
+                    ),
+                )
+            site_segment = f"{parts[0]}/{parts[1]}"  # e.g. "sites/AIAutomationTeam"
+            remaining = parts[2:]                    # e.g. ["Shared Documents", "A", "B"]
+
+            # Resolve site
+            site_resp = requests.get(
+                f"{GRAPH}/sites/{hostname}:/{site_segment}",
+                headers=auth_headers,
+                timeout=30,
             )
-        share_item = share_resp.json()
-        parent_ref = share_item.get("parentReference", {})
-        drive_id = parent_ref.get("driveId") or share_item.get("parentReference", {}).get("driveId")
-        folder_id = share_item.get("id")
+            if site_resp.status_code != 200:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Failed to resolve SharePoint site: {site_resp.text}",
+                )
+            site_id = site_resp.json().get("id")
+
+            # Find the drive matching the library segment (first remaining part).
+            # Falls back to the site's default drive if no match.
+            library_name = remaining[0] if remaining else None
+            folder_path_parts = remaining[1:] if remaining else []
+
+            drives_resp = requests.get(
+                f"{GRAPH}/sites/{site_id}/drives",
+                headers=auth_headers,
+                timeout=30,
+            )
+            matched_drive = None
+            if drives_resp.status_code == 200 and library_name:
+                for d in drives_resp.json().get("value", []):
+                    web_url = d.get("webUrl", "")
+                    if d.get("name") == library_name or web_url.rstrip("/").endswith(
+                        "/" + library_name.replace(" ", "%20")
+                    ):
+                        matched_drive = d
+                        break
+
+            if matched_drive is None:
+                # Use default drive (typically "Shared Documents" / "Documents")
+                default_resp = requests.get(
+                    f"{GRAPH}/sites/{site_id}/drive",
+                    headers=auth_headers,
+                    timeout=30,
+                )
+                if default_resp.status_code != 200:
+                    raise HTTPException(
+                        status_code=502,
+                        detail=f"Failed to get default drive: {default_resp.text}",
+                    )
+                matched_drive = default_resp.json()
+                # If the first remaining part wasn't actually a library name,
+                # treat the entire `remaining` as the folder path.
+                if library_name and library_name not in (
+                    matched_drive.get("name"),
+                    "Shared Documents",
+                    "Documents",
+                ):
+                    folder_path_parts = remaining
+
+            drive_id = matched_drive.get("id")
+            folder_path = "/".join(folder_path_parts)
+
+            if folder_path:
+                folder_resp = requests.get(
+                    f"{GRAPH}/drives/{drive_id}/root:/"
+                    f"{requests.utils.quote(folder_path)}",
+                    headers=auth_headers,
+                    timeout=30,
+                )
+                if folder_resp.status_code != 200:
+                    raise HTTPException(
+                        status_code=502,
+                        detail=(
+                            f"Failed to resolve folder path '{folder_path}' in drive: "
+                            f"{folder_resp.text}"
+                        ),
+                    )
+                folder_id = folder_resp.json().get("id")
+            else:
+                root_resp = requests.get(
+                    f"{GRAPH}/drives/{drive_id}/root",
+                    headers=auth_headers,
+                    timeout=30,
+                )
+                if root_resp.status_code != 200:
+                    raise HTTPException(
+                        status_code=502,
+                        detail=f"Failed to get drive root: {root_resp.text}",
+                    )
+                folder_id = root_resp.json().get("id")
+
         if not drive_id or not folder_id:
             raise HTTPException(
                 status_code=502,
-                detail=f"Could not determine driveId/itemId from share response: {share_item}",
-            )
-        if "folder" not in share_item:
-            logger.warning(
-                "Resolved share item is not a folder; uploading alongside it in its parent"
+                detail="Could not resolve SharePoint folder (missing driveId/itemId)",
             )
 
         # 3. Download the source file.
