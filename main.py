@@ -3185,36 +3185,76 @@ async def upload_to_sharepoint(
                     folder_path_parts = remaining
 
             drive_id = matched_drive.get("id")
-            folder_path = "/".join(folder_path_parts)
 
-            if folder_path:
-                folder_resp = requests.get(
-                    f"{GRAPH}/drives/{drive_id}/root:/"
-                    f"{requests.utils.quote(folder_path)}",
-                    headers=auth_headers,
-                    timeout=30,
+            # Walk the folder path one segment at a time, listing children
+            # and matching case-insensitively. This avoids encoding pitfalls
+            # and library-name guessing errors (e.g. "Documents" vs "Shared Documents").
+            root_resp = requests.get(
+                f"{GRAPH}/drives/{drive_id}/root",
+                headers=auth_headers,
+                timeout=30,
+            )
+            if root_resp.status_code != 200:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Failed to get drive root: {root_resp.text}",
                 )
-                if folder_resp.status_code != 200:
-                    raise HTTPException(
-                        status_code=502,
-                        detail=(
-                            f"Failed to resolve folder path '{folder_path}' in drive: "
-                            f"{folder_resp.text}"
-                        ),
+            current_id = root_resp.json().get("id")
+
+            # Build the list of segments to walk. Try the trimmed list first;
+            # if any segment is missing we'll retry from the full `remaining`
+            # list (in case the library segment shouldn't have been stripped).
+            walk_attempts = [folder_path_parts]
+            if folder_path_parts != remaining:
+                walk_attempts.append(remaining)
+
+            walked = False
+            last_error = None
+            for attempt in walk_attempts:
+                cursor = current_id
+                ok = True
+                for segment in attempt:
+                    children_url = (
+                        f"{GRAPH}/drives/{drive_id}/items/{cursor}/children"
+                        f"?$top=200&$select=id,name,folder"
                     )
-                folder_id = folder_resp.json().get("id")
-            else:
-                root_resp = requests.get(
-                    f"{GRAPH}/drives/{drive_id}/root",
-                    headers=auth_headers,
-                    timeout=30,
+                    found_child = None
+                    while children_url:
+                        ch_resp = requests.get(
+                            children_url, headers=auth_headers, timeout=30
+                        )
+                        if ch_resp.status_code != 200:
+                            last_error = ch_resp.text
+                            ok = False
+                            break
+                        ch_json = ch_resp.json()
+                        for child in ch_json.get("value", []):
+                            if child.get("name", "").lower() == segment.lower():
+                                found_child = child
+                                break
+                        if found_child:
+                            break
+                        children_url = ch_json.get("@odata.nextLink")
+                    if not ok or not found_child:
+                        ok = False
+                        last_error = last_error or (
+                            f"Folder segment '{segment}' not found under item {cursor}"
+                        )
+                        break
+                    cursor = found_child["id"]
+                if ok:
+                    folder_id = cursor
+                    walked = True
+                    break
+
+            if not walked:
+                raise HTTPException(
+                    status_code=502,
+                    detail=(
+                        f"Failed to resolve folder path "
+                        f"'{'/'.join(folder_path_parts)}' in drive: {last_error}"
+                    ),
                 )
-                if root_resp.status_code != 200:
-                    raise HTTPException(
-                        status_code=502,
-                        detail=f"Failed to get drive root: {root_resp.text}",
-                    )
-                folder_id = root_resp.json().get("id")
 
         if not drive_id or not folder_id:
             raise HTTPException(
