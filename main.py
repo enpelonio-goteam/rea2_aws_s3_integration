@@ -144,6 +144,17 @@ class MarkdownToDocxRequest(BaseModel):
     text: str  # Markdown text to convert
     filename: Optional[str] = None  # Optional output filename (without extension)
 
+class UploadToSharepointRequest(BaseModel):
+    """
+    Request model for uploading a publicly accessible file to a SharePoint folder
+    via Microsoft Graph using a sharing URL.
+
+    The Authorization header must be: Bearer <sharepoint_access_token>
+    """
+    file_url: str  # Publicly accessible URL of the file to upload
+    sharepoint_url: str  # SharePoint sharing URL of the destination folder
+    filename: Optional[str] = None  # Optional override for the uploaded filename
+
 app = FastAPI(title="Logic Provider Functions", version="1.0.0")
 
 # AWS S3 configuration
@@ -190,7 +201,7 @@ async def root():
     return {
         "message": "Logic Provider Functions API", 
         "status": "running",
-        "endpoints": ["/upload-html", "/generate-image", "/html-to-image", "/optimize-image-to-s3", "/process-loom-video", "/upload-linkedin-video", "/url-to-google-drive", "/eleven-labs-speech", "/heygen-avatar-iv", "/google-drive-to-s3", "/telegram-file/bot{BotToken}/{file_path}", "/transcribe-audio", "/analyze-images", "/markdown-to-docx", "/health"],
+        "endpoints": ["/upload-html", "/generate-image", "/html-to-image", "/optimize-image-to-s3", "/process-loom-video", "/upload-linkedin-video", "/url-to-google-drive", "/eleven-labs-speech", "/heygen-avatar-iv", "/google-drive-to-s3", "/telegram-file/bot{BotToken}/{file_path}", "/transcribe-audio", "/analyze-images", "/markdown-to-docx", "/upload-to-sharepoint", "/health"],
         "aws_configured": bool(AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY and S3_BUCKET_NAME),
         "timestamp": datetime.now().isoformat()
     }
@@ -3031,6 +3042,199 @@ async def markdown_to_docx(request: MarkdownToDocxRequest):
     except Exception as e:
         logger.error(f"Error converting markdown to docx: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to convert markdown: {str(e)}")
+
+@app.post("/upload-to-sharepoint")
+async def upload_to_sharepoint(
+    request: UploadToSharepointRequest,
+    authorization: Optional[str] = Header(None),
+):
+    """
+    Download a file from a public URL and upload it to a SharePoint folder
+    referenced by its sharing URL, using the caller's Microsoft Graph
+    delegated access token.
+
+    Headers:
+        Authorization: Bearer <sharepoint_access_token>
+
+    Body:
+        file_url: Publicly accessible URL of the file to upload
+        sharepoint_url: SharePoint sharing URL of the destination folder
+        filename: Optional override for the uploaded filename
+    """
+    logger.info(
+        f"Upload-to-sharepoint request - file_url: {request.file_url}, "
+        f"sharepoint_url: {request.sharepoint_url}, filename: {request.filename}"
+    )
+
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(
+            status_code=401,
+            detail="Missing or invalid Authorization header (expected 'Bearer <token>')",
+        )
+    access_token = authorization.split(" ", 1)[1].strip()
+
+    GRAPH = "https://graph.microsoft.com/v1.0"
+    auth_headers = {"Authorization": f"Bearer {access_token}"}
+
+    try:
+        # 1. Encode SharePoint sharing URL into a Graph share ID.
+        #    Format: "u!" + base64url(url) without padding.
+        share_b64 = (
+            base64.urlsafe_b64encode(request.sharepoint_url.encode("utf-8"))
+            .decode("ascii")
+            .rstrip("=")
+        )
+        share_id = f"u!{share_b64}"
+
+        # 2. Resolve the share to a driveItem (the destination folder).
+        share_resp = requests.get(
+            f"{GRAPH}/shares/{share_id}/driveItem",
+            headers=auth_headers,
+            timeout=30,
+        )
+        if share_resp.status_code != 200:
+            logger.error(
+                f"Failed to resolve share URL: {share_resp.status_code} {share_resp.text}"
+            )
+            raise HTTPException(
+                status_code=share_resp.status_code if share_resp.status_code in (401, 403, 404) else 502,
+                detail=f"Failed to resolve SharePoint share URL: {share_resp.text}",
+            )
+        share_item = share_resp.json()
+        parent_ref = share_item.get("parentReference", {})
+        drive_id = parent_ref.get("driveId") or share_item.get("parentReference", {}).get("driveId")
+        folder_id = share_item.get("id")
+        if not drive_id or not folder_id:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Could not determine driveId/itemId from share response: {share_item}",
+            )
+        if "folder" not in share_item:
+            logger.warning(
+                "Resolved share item is not a folder; uploading alongside it in its parent"
+            )
+
+        # 3. Download the source file.
+        file_resp = requests.get(request.file_url, stream=True, timeout=120)
+        if file_resp.status_code != 200:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Failed to download source file: HTTP {file_resp.status_code}",
+            )
+        file_bytes = file_resp.content
+        file_size = len(file_bytes)
+
+        # Determine filename
+        if request.filename:
+            upload_name = request.filename
+        else:
+            parsed = urlparse(request.file_url)
+            upload_name = unquote(os.path.basename(parsed.path)) or f"upload_{uuid.uuid4().hex[:8]}"
+        # Make safe-ish for SharePoint
+        upload_name = upload_name.replace("/", "_").replace("\\", "_").strip()
+        if not upload_name:
+            upload_name = f"upload_{uuid.uuid4().hex[:8]}"
+
+        logger.info(
+            f"Resolved folder driveId={drive_id} itemId={folder_id}; uploading {upload_name} ({file_size} bytes)"
+        )
+
+        # 4. Create an upload session and PUT the file in chunks.
+        session_url = (
+            f"{GRAPH}/drives/{drive_id}/items/{folder_id}:/"
+            f"{requests.utils.quote(upload_name)}:/createUploadSession"
+        )
+        session_body = {
+            "item": {
+                "@microsoft.graph.conflictBehavior": "rename",
+                "name": upload_name,
+            }
+        }
+        session_resp = requests.post(
+            session_url,
+            headers={**auth_headers, "Content-Type": "application/json"},
+            json=session_body,
+            timeout=30,
+        )
+        if session_resp.status_code not in (200, 201):
+            logger.error(
+                f"Failed to create upload session: {session_resp.status_code} {session_resp.text}"
+            )
+            raise HTTPException(
+                status_code=502,
+                detail=f"Failed to create SharePoint upload session: {session_resp.text}",
+            )
+        upload_url = session_resp.json().get("uploadUrl")
+        if not upload_url:
+            raise HTTPException(status_code=502, detail="Upload session missing uploadUrl")
+
+        # Chunked PUT. Graph requires multiples of 320 KiB for non-final chunks.
+        CHUNK = 5 * 320 * 1024  # 1.6 MiB
+        final_resp = None
+        if file_size == 0:
+            # Graph still expects a PUT for empty files
+            final_resp = requests.put(
+                upload_url,
+                headers={"Content-Range": "bytes 0-0/0", "Content-Length": "0"},
+                data=b"",
+                timeout=60,
+            )
+        else:
+            for start in range(0, file_size, CHUNK):
+                end = min(start + CHUNK, file_size) - 1
+                chunk = file_bytes[start : end + 1]
+                headers = {
+                    "Content-Length": str(len(chunk)),
+                    "Content-Range": f"bytes {start}-{end}/{file_size}",
+                }
+                final_resp = requests.put(upload_url, headers=headers, data=chunk, timeout=300)
+                if final_resp.status_code not in (200, 201, 202):
+                    logger.error(
+                        f"Chunk upload failed at {start}-{end}: "
+                        f"{final_resp.status_code} {final_resp.text}"
+                    )
+                    # Best-effort cancel of the session
+                    try:
+                        requests.delete(upload_url, timeout=15)
+                    except Exception:
+                        pass
+                    raise HTTPException(
+                        status_code=502,
+                        detail=f"SharePoint chunk upload failed: {final_resp.text}",
+                    )
+
+        if final_resp is None or final_resp.status_code not in (200, 201):
+            raise HTTPException(
+                status_code=502,
+                detail=f"Upload did not complete successfully (status {getattr(final_resp, 'status_code', 'n/a')})",
+            )
+
+        uploaded_item = final_resp.json()
+        logger.info(
+            f"Successfully uploaded to SharePoint: id={uploaded_item.get('id')} "
+            f"name={uploaded_item.get('name')}"
+        )
+
+        return JSONResponse(
+            status_code=200,
+            content={
+                "success": True,
+                "message": "File uploaded to SharePoint successfully",
+                "item_id": uploaded_item.get("id"),
+                "name": uploaded_item.get("name"),
+                "web_url": uploaded_item.get("webUrl"),
+                "size": uploaded_item.get("size"),
+                "drive_id": drive_id,
+                "parent_folder_id": folder_id,
+                "uploaded_at": datetime.now().isoformat(),
+            },
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error uploading to SharePoint: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to upload to SharePoint: {str(e)}")
 
 @app.get("/health")
 async def health_check():
