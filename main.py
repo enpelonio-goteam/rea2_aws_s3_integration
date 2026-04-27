@@ -144,6 +144,15 @@ class MarkdownToDocxRequest(BaseModel):
     text: str  # Markdown text to convert
     filename: Optional[str] = None  # Optional output filename (without extension)
 
+class ListSharepointSubfoldersRequest(BaseModel):
+    """
+    Request model for listing immediate subfolders of a SharePoint folder
+    via Graph using app-only auth.
+    """
+    sharepoint_url: str  # SharePoint URL of the parent folder
+    recursive: Optional[bool] = False  # If true, list folders at all depths
+    include_files: Optional[bool] = False  # If true, include files alongside folders
+
 class CreateSharepointFolderRequest(BaseModel):
     """
     Request model for creating a folder inside a SharePoint folder via Graph
@@ -386,7 +395,7 @@ async def root():
     return {
         "message": "Logic Provider Functions API", 
         "status": "running",
-        "endpoints": ["/upload-html", "/generate-image", "/html-to-image", "/optimize-image-to-s3", "/process-loom-video", "/upload-linkedin-video", "/url-to-google-drive", "/eleven-labs-speech", "/heygen-avatar-iv", "/google-drive-to-s3", "/telegram-file/bot{BotToken}/{file_path}", "/transcribe-audio", "/analyze-images", "/markdown-to-docx", "/upload-to-sharepoint", "/create-sharepoint-folder", "/health"],
+        "endpoints": ["/upload-html", "/generate-image", "/html-to-image", "/optimize-image-to-s3", "/process-loom-video", "/upload-linkedin-video", "/url-to-google-drive", "/eleven-labs-speech", "/heygen-avatar-iv", "/google-drive-to-s3", "/telegram-file/bot{BotToken}/{file_path}", "/transcribe-audio", "/analyze-images", "/markdown-to-docx", "/upload-to-sharepoint", "/create-sharepoint-folder", "/list-sharepoint-subfolders", "/health"],
         "aws_configured": bool(AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY and S3_BUCKET_NAME),
         "timestamp": datetime.now().isoformat()
     }
@@ -3227,6 +3236,91 @@ async def markdown_to_docx(request: MarkdownToDocxRequest):
     except Exception as e:
         logger.error(f"Error converting markdown to docx: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to convert markdown: {str(e)}")
+
+@app.post("/list-sharepoint-subfolders")
+async def list_sharepoint_subfolders(request: ListSharepointSubfoldersRequest):
+    """
+    List subfolders (and optionally files) inside a SharePoint folder via
+    Microsoft Graph using app-only auth.
+
+    Body:
+        sharepoint_url: SharePoint URL of the parent folder
+        recursive: If true, walk the folder tree recursively
+        include_files: If true, include files in the response alongside folders
+    """
+    logger.info(
+        f"List-sharepoint-subfolders request - parent: {request.sharepoint_url}, "
+        f"recursive: {request.recursive}, include_files: {request.include_files}"
+    )
+
+    GRAPH = "https://graph.microsoft.com/v1.0"
+    drive_id, folder_id = _resolve_sharepoint_folder(request.sharepoint_url)
+    auth_headers = {"Authorization": f"Bearer {_get_graph_app_token()}"}
+
+    def _fetch_children(parent_id):
+        out = []
+        url = (
+            f"{GRAPH}/drives/{drive_id}/items/{parent_id}/children"
+            f"?$top=200&$select=id,name,webUrl,size,folder,file,parentReference"
+        )
+        while url:
+            r = requests.get(url, headers=auth_headers, timeout=30)
+            if r.status_code != 200:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Failed to list folder contents: {r.text}",
+                )
+            j = r.json()
+            out.extend(j.get("value", []))
+            url = j.get("@odata.nextLink")
+        return out
+
+    def _shape(item, path):
+        is_folder = "folder" in item
+        return {
+            "id": item.get("id"),
+            "name": item.get("name"),
+            "is_folder": is_folder,
+            "path": path,
+            "web_url": item.get("webUrl"),
+            "size": item.get("size"),
+            "child_count": (item.get("folder") or {}).get("childCount") if is_folder else None,
+        }
+
+    results = []
+    if not request.recursive:
+        for item in _fetch_children(folder_id):
+            if "folder" in item or request.include_files:
+                results.append(_shape(item, item.get("name", "")))
+    else:
+        # BFS walk; track relative paths from the requested folder.
+        queue = [(folder_id, "")]
+        while queue:
+            current_id, prefix = queue.pop(0)
+            for item in _fetch_children(current_id):
+                rel_path = (
+                    f"{prefix}/{item.get('name', '')}".lstrip("/")
+                    if prefix
+                    else item.get("name", "")
+                )
+                if "folder" in item:
+                    results.append(_shape(item, rel_path))
+                    queue.append((item["id"], rel_path))
+                elif request.include_files:
+                    results.append(_shape(item, rel_path))
+
+    return JSONResponse(
+        status_code=200,
+        content={
+            "success": True,
+            "drive_id": drive_id,
+            "parent_folder_id": folder_id,
+            "count": len(results),
+            "items": results,
+            "listed_at": datetime.now().isoformat(),
+        },
+    )
+
 
 @app.post("/create-sharepoint-folder")
 async def create_sharepoint_folder(request: CreateSharepointFolderRequest):
