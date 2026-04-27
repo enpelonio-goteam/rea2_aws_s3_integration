@@ -147,12 +147,12 @@ class MarkdownToDocxRequest(BaseModel):
 class UploadToSharepointRequest(BaseModel):
     """
     Request model for uploading a publicly accessible file to a SharePoint folder
-    via Microsoft Graph using a sharing URL.
-
-    The Authorization header must be: Bearer <sharepoint_access_token>
+    via Microsoft Graph. Authentication uses an Azure AD app registration
+    (client credentials flow); credentials are read from env vars
+    SHAREPOINT_TENANT_ID, SHAREPOINT_CLIENT_ID, SHAREPOINT_CLIENT_SECRET.
     """
     file_url: str  # Publicly accessible URL of the file to upload
-    sharepoint_url: str  # SharePoint sharing URL of the destination folder
+    sharepoint_url: str  # SharePoint folder URL (browser-copied URL works)
     filename: Optional[str] = None  # Optional override for the uploaded filename
 
 app = FastAPI(title="Logic Provider Functions", version="1.0.0")
@@ -165,6 +165,49 @@ S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME")
 
 # Assembly AI configuration
 ASSEMBLY_AI_API_KEY = os.getenv("ASSEMBLY_AI_API_KEY")
+
+# SharePoint / Microsoft Graph (client credentials) configuration
+SHAREPOINT_TENANT_ID = os.getenv("SHAREPOINT_TENANT_ID")
+SHAREPOINT_CLIENT_ID = os.getenv("SHAREPOINT_CLIENT_ID")
+SHAREPOINT_CLIENT_SECRET = os.getenv("SHAREPOINT_CLIENT_SECRET")
+_graph_token_cache = {"token": None, "expires_at": 0.0}
+
+
+def _get_graph_app_token():
+    """Return a cached app-only Microsoft Graph access token."""
+    now = time.time()
+    if (
+        _graph_token_cache["token"]
+        and now < _graph_token_cache["expires_at"] - 60
+    ):
+        return _graph_token_cache["token"]
+    if not all([SHAREPOINT_TENANT_ID, SHAREPOINT_CLIENT_ID, SHAREPOINT_CLIENT_SECRET]):
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "SharePoint app credentials not configured. Set "
+                "SHAREPOINT_TENANT_ID, SHAREPOINT_CLIENT_ID, SHAREPOINT_CLIENT_SECRET."
+            ),
+        )
+    resp = requests.post(
+        f"https://login.microsoftonline.com/{SHAREPOINT_TENANT_ID}/oauth2/v2.0/token",
+        data={
+            "grant_type": "client_credentials",
+            "client_id": SHAREPOINT_CLIENT_ID,
+            "client_secret": SHAREPOINT_CLIENT_SECRET,
+            "scope": "https://graph.microsoft.com/.default",
+        },
+        timeout=30,
+    )
+    if resp.status_code != 200:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to obtain Graph token: {resp.status_code} {resp.text}",
+        )
+    j = resp.json()
+    _graph_token_cache["token"] = j["access_token"]
+    _graph_token_cache["expires_at"] = now + float(j.get("expires_in", 3600))
+    return _graph_token_cache["token"]
 
 # Initialize S3 client
 s3_client = None
@@ -3044,21 +3087,18 @@ async def markdown_to_docx(request: MarkdownToDocxRequest):
         raise HTTPException(status_code=500, detail=f"Failed to convert markdown: {str(e)}")
 
 @app.post("/upload-to-sharepoint")
-async def upload_to_sharepoint(
-    request: UploadToSharepointRequest,
-    authorization: Optional[str] = Header(None),
-):
+async def upload_to_sharepoint(request: UploadToSharepointRequest):
     """
     Download a file from a public URL and upload it to a SharePoint folder
-    referenced by its sharing URL, using the caller's Microsoft Graph
-    delegated access token.
+    via Microsoft Graph using app-only (client-credentials) authentication.
 
-    Headers:
-        Authorization: Bearer <sharepoint_access_token>
+    Credentials come from the env: SHAREPOINT_TENANT_ID, SHAREPOINT_CLIENT_ID,
+    SHAREPOINT_CLIENT_SECRET. The app registration must have the application
+    permission `Sites.ReadWrite.All` granted with admin consent.
 
     Body:
         file_url: Publicly accessible URL of the file to upload
-        sharepoint_url: SharePoint sharing URL of the destination folder
+        sharepoint_url: SharePoint folder URL (browser-copied URL works)
         filename: Optional override for the uploaded filename
     """
     logger.info(
@@ -3066,232 +3106,144 @@ async def upload_to_sharepoint(
         f"sharepoint_url: {request.sharepoint_url}, filename: {request.filename}"
     )
 
-    if not authorization or not authorization.lower().startswith("bearer "):
-        raise HTTPException(
-            status_code=401,
-            detail="Missing or invalid Authorization header (expected 'Bearer <token>')",
-        )
-    access_token = authorization.split(" ", 1)[1].strip()
-
     GRAPH = "https://graph.microsoft.com/v1.0"
+    access_token = _get_graph_app_token()
     auth_headers = {"Authorization": f"Bearer {access_token}"}
 
     try:
-        drive_id = None
-        folder_id = None
-        share_attempt_log = []  # collected for diagnostics if everything fails
+        # 1. Parse the SharePoint URL into hostname + site path + folder path.
+        parsed = urlparse(request.sharepoint_url)
+        hostname = parsed.netloc
+        path = unquote(parsed.path).lstrip("/")
+        path = re.sub(r"^:[a-z]:/[a-z]/", "", path)
+        parts = [p for p in path.split("/") if p]
+        if len(parts) < 2 or parts[0] not in ("sites", "teams"):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Could not parse SharePoint URL. Expected a path containing "
+                    f"'sites/<name>' or 'teams/<name>'. Got: {request.sharepoint_url}"
+                ),
+            )
+        site_segment = f"{parts[0]}/{parts[1]}"
+        remaining = parts[2:]  # e.g. ["Shared Documents", "Folder", "Subfolder"]
 
-        # 1a. Try resolving as a Graph sharing link first.
-        #     Using `Prefer: redeemSharingLink` makes Graph redeem the link's
-        #     permission for the caller, which is necessary for browser-copied
-        #     URLs (`:f:/r/...?e=<token>`) where the caller's only access is
-        #     via that link.
-        share_b64 = (
-            base64.urlsafe_b64encode(request.sharepoint_url.encode("utf-8"))
-            .decode("ascii")
-            .rstrip("=")
+        # 2. Resolve site -> siteId.
+        site_resp = requests.get(
+            f"{GRAPH}/sites/{hostname}:/{site_segment}",
+            headers=auth_headers,
+            timeout=30,
         )
-        share_id = f"u!{share_b64}"
-        # Try a few prefer-header variants. Some sharing URLs need redemption,
-        # some don't, and the right header depends on the link type.
-        share_resp = None
-        for prefer in ("redeemSharingLink", "redeemSharingLinkIfNecessary", None):
-            headers = dict(auth_headers)
-            if prefer:
-                headers["Prefer"] = prefer
-            r = requests.get(
-                f"{GRAPH}/shares/{share_id}/driveItem",
-                headers=headers,
-                timeout=30,
-            )
-            share_attempt_log.append(
-                f"prefer={prefer or 'none'} status={r.status_code} "
-                f"body={r.text[:300]}"
-            )
-            if r.status_code == 200:
-                share_resp = r
-                break
-            share_resp = r  # keep latest for fallback decision
-
-        if share_resp.status_code == 200:
-            share_item = share_resp.json()
-            parent_ref = share_item.get("parentReference", {})
-            drive_id = parent_ref.get("driveId")
-            folder_id = share_item.get("id")
-            if "folder" not in share_item:
-                logger.warning(
-                    "Resolved share item is not a folder; uploading alongside it in its parent"
-                )
-        else:
-            # 1b. Fall back to parsing the URL as a SharePoint path.
-            #     Handles browser-copied URLs like:
-            #       https://{host}/:f:/r/sites/{site}/{library}/{folder/path}?...
-            #       https://{host}/sites/{site}/{library}/{folder/path}
-            logger.info(
-                f"/shares lookup failed ({share_resp.status_code}); "
-                f"falling back to path parsing"
-            )
-            parsed = urlparse(request.sharepoint_url)
-            hostname = parsed.netloc
-            path = unquote(parsed.path).lstrip("/")
-            # Strip ":<x>:/<y>/" prefix if present (e.g. ":f:/r/", ":w:/r/")
-            path = re.sub(r"^:[a-z]:/[a-z]/", "", path)
-            parts = [p for p in path.split("/") if p]
-            if len(parts) < 2 or parts[0] not in ("sites", "teams"):
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        f"Could not parse SharePoint URL. Expected a path containing "
-                        f"'sites/<name>' or 'teams/<name>'. Got: {request.sharepoint_url}"
-                    ),
-                )
-            site_segment = f"{parts[0]}/{parts[1]}"  # e.g. "sites/AIAutomationTeam"
-            remaining = parts[2:]                    # e.g. ["Shared Documents", "A", "B"]
-
-            # Resolve site
-            site_resp = requests.get(
-                f"{GRAPH}/sites/{hostname}:/{site_segment}",
-                headers=auth_headers,
-                timeout=30,
-            )
-            if site_resp.status_code != 200:
-                raise HTTPException(
-                    status_code=502,
-                    detail=f"Failed to resolve SharePoint site: {site_resp.text}",
-                )
-            site_id = site_resp.json().get("id")
-
-            # Find the drive matching the library segment (first remaining part).
-            # Falls back to the site's default drive if no match.
-            library_name = remaining[0] if remaining else None
-            folder_path_parts = remaining[1:] if remaining else []
-
-            # Collect candidate drives: every drive in the site, plus the
-            # site's default drive. We'll try each one until the path resolves.
-            drives_resp = requests.get(
-                f"{GRAPH}/sites/{site_id}/drives",
-                headers=auth_headers,
-                timeout=30,
-            )
-            candidate_drives = []
-            seen_drive_ids = set()
-            if drives_resp.status_code == 200:
-                for d in drives_resp.json().get("value", []):
-                    if d.get("id") and d["id"] not in seen_drive_ids:
-                        candidate_drives.append(d)
-                        seen_drive_ids.add(d["id"])
-            default_resp = requests.get(
-                f"{GRAPH}/sites/{site_id}/drive",
-                headers=auth_headers,
-                timeout=30,
-            )
-            if default_resp.status_code == 200:
-                d = default_resp.json()
-                if d.get("id") and d["id"] not in seen_drive_ids:
-                    candidate_drives.append(d)
-                    seen_drive_ids.add(d["id"])
-
-            if not candidate_drives:
-                raise HTTPException(
-                    status_code=502,
-                    detail="No SharePoint drives accessible for this site",
-                )
-
-            # Reorder so drives whose name/webUrl matches the library segment go first.
-            if library_name:
-                def _score(d):
-                    name = d.get("name", "")
-                    web = d.get("webUrl", "").rstrip("/")
-                    if name == library_name:
-                        return 0
-                    if web.endswith("/" + library_name.replace(" ", "%20")):
-                        return 1
-                    return 2
-                candidate_drives.sort(key=_score)
-
-            def _walk(drive, segments):
-                """Walk segments under drive root; return folder_id or None + diagnostic."""
-                drv_id = drive.get("id")
-                root_resp_local = requests.get(
-                    f"{GRAPH}/drives/{drv_id}/root",
-                    headers=auth_headers,
-                    timeout=30,
-                )
-                if root_resp_local.status_code != 200:
-                    return None, f"root fetch failed: {root_resp_local.text}"
-                cursor = root_resp_local.json().get("id")
-                seen_names = []
-                for segment in segments:
-                    children_url = (
-                        f"{GRAPH}/drives/{drv_id}/items/{cursor}/children"
-                        f"?$top=200&$select=id,name,folder"
-                    )
-                    found_child = None
-                    seen_names = []
-                    while children_url:
-                        ch_resp = requests.get(
-                            children_url, headers=auth_headers, timeout=30
-                        )
-                        if ch_resp.status_code != 200:
-                            return None, f"children fetch failed: {ch_resp.text}"
-                        ch_json = ch_resp.json()
-                        for child in ch_json.get("value", []):
-                            seen_names.append(child.get("name", ""))
-                            if child.get("name", "").lower() == segment.lower():
-                                found_child = child
-                                break
-                        if found_child:
-                            break
-                        children_url = ch_json.get("@odata.nextLink")
-                    if not found_child:
-                        return None, (
-                            f"segment '{segment}' not found; "
-                            f"available: {seen_names[:20]}"
-                        )
-                    cursor = found_child["id"]
-                return cursor, None
-
-            # Try each candidate drive with two segment lists: the trimmed
-            # version (library segment removed) and the full `remaining` list.
-            attempt_segments = [folder_path_parts]
-            if folder_path_parts != remaining:
-                attempt_segments.append(remaining)
-
-            walked_drive = None
-            walked_folder_id = None
-            diagnostics = []
-            for d in candidate_drives:
-                for segs in attempt_segments:
-                    fid, err = _walk(d, segs)
-                    if fid:
-                        walked_drive = d
-                        walked_folder_id = fid
-                        break
-                    diagnostics.append(
-                        f"drive '{d.get('name')}' ({d.get('id')}) "
-                        f"segs={segs}: {err}"
-                    )
-                if walked_folder_id:
-                    break
-
-            if not walked_folder_id:
-                raise HTTPException(
-                    status_code=502,
-                    detail=(
-                        f"Failed to resolve folder path '{'/'.join(remaining)}'. "
-                        f"/shares attempts: {share_attempt_log}. "
-                        f"Path-walk diagnostics: {diagnostics}"
-                    ),
-                )
-
-            drive_id = walked_drive.get("id")
-            folder_id = walked_folder_id
-
-        if not drive_id or not folder_id:
+        if site_resp.status_code != 200:
             raise HTTPException(
                 status_code=502,
-                detail="Could not resolve SharePoint folder (missing driveId/itemId)",
+                detail=f"Failed to resolve SharePoint site: {site_resp.text}",
             )
+        site_id = site_resp.json().get("id")
+
+        # 3. Pick the drive whose name/webUrl matches the library segment;
+        #    fall back to the site's default drive.
+        library_name = remaining[0] if remaining else None
+        folder_path_parts = remaining[1:] if remaining else []
+
+        drives_resp = requests.get(
+            f"{GRAPH}/sites/{site_id}/drives", headers=auth_headers, timeout=30
+        )
+        candidate_drives = []
+        seen = set()
+        if drives_resp.status_code == 200:
+            for d in drives_resp.json().get("value", []):
+                if d.get("id") and d["id"] not in seen:
+                    candidate_drives.append(d)
+                    seen.add(d["id"])
+        default_resp = requests.get(
+            f"{GRAPH}/sites/{site_id}/drive", headers=auth_headers, timeout=30
+        )
+        if default_resp.status_code == 200:
+            d = default_resp.json()
+            if d.get("id") and d["id"] not in seen:
+                candidate_drives.append(d)
+                seen.add(d["id"])
+        if not candidate_drives:
+            raise HTTPException(
+                status_code=502, detail="No SharePoint drives accessible for this site"
+            )
+        if library_name:
+            def _score(d):
+                name = d.get("name", "")
+                web = d.get("webUrl", "").rstrip("/")
+                if name == library_name:
+                    return 0
+                if web.endswith("/" + library_name.replace(" ", "%20")):
+                    return 1
+                return 2
+            candidate_drives.sort(key=_score)
+
+        def _walk(drive, segments):
+            drv_id = drive.get("id")
+            root_resp_local = requests.get(
+                f"{GRAPH}/drives/{drv_id}/root", headers=auth_headers, timeout=30
+            )
+            if root_resp_local.status_code != 200:
+                return None, f"root fetch failed: {root_resp_local.text}"
+            cursor = root_resp_local.json().get("id")
+            for segment in segments:
+                children_url = (
+                    f"{GRAPH}/drives/{drv_id}/items/{cursor}/children"
+                    f"?$top=200&$select=id,name,folder"
+                )
+                found_child = None
+                seen_names = []
+                while children_url:
+                    ch_resp = requests.get(children_url, headers=auth_headers, timeout=30)
+                    if ch_resp.status_code != 200:
+                        return None, f"children fetch failed: {ch_resp.text}"
+                    ch_json = ch_resp.json()
+                    for child in ch_json.get("value", []):
+                        seen_names.append(child.get("name", ""))
+                        if child.get("name", "").lower() == segment.lower():
+                            found_child = child
+                            break
+                    if found_child:
+                        break
+                    children_url = ch_json.get("@odata.nextLink")
+                if not found_child:
+                    return None, (
+                        f"segment '{segment}' not found; available: {seen_names[:20]}"
+                    )
+                cursor = found_child["id"]
+            return cursor, None
+
+        attempt_segments = [folder_path_parts]
+        if folder_path_parts != remaining:
+            attempt_segments.append(remaining)
+
+        walked_drive = None
+        folder_id = None
+        diagnostics = []
+        for d in candidate_drives:
+            for segs in attempt_segments:
+                fid, err = _walk(d, segs)
+                if fid:
+                    walked_drive = d
+                    folder_id = fid
+                    break
+                diagnostics.append(
+                    f"drive '{d.get('name')}' ({d.get('id')}) segs={segs}: {err}"
+                )
+            if folder_id:
+                break
+
+        if not folder_id:
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    f"Failed to resolve folder path '{'/'.join(remaining)}'. "
+                    f"Diagnostics: {diagnostics}"
+                ),
+            )
+
+        drive_id = walked_drive.get("id")
 
         # 3. Download the source file.
         file_resp = requests.get(request.file_url, stream=True, timeout=120)
