@@ -144,6 +144,15 @@ class MarkdownToDocxRequest(BaseModel):
     text: str  # Markdown text to convert
     filename: Optional[str] = None  # Optional output filename (without extension)
 
+class CreateSharepointFolderRequest(BaseModel):
+    """
+    Request model for creating a folder inside a SharePoint folder via Graph
+    using app-only auth.
+    """
+    sharepoint_url: str  # SharePoint URL of the parent folder
+    folder_name: str  # Name of the new folder to create
+    conflict_behavior: Optional[str] = "rename"  # "rename", "replace", or "fail"
+
 class UploadToSharepointRequest(BaseModel):
     """
     Request model for uploading a publicly accessible file to a SharePoint folder
@@ -209,6 +218,139 @@ def _get_graph_app_token():
     _graph_token_cache["expires_at"] = now + float(j.get("expires_in", 3600))
     return _graph_token_cache["token"]
 
+
+def _resolve_sharepoint_folder(sharepoint_url: str):
+    """
+    Resolve a SharePoint folder URL to (drive_id, folder_id) via Microsoft
+    Graph using app-only auth. Walks the path segment-by-segment under each
+    candidate drive in the site so library/folder name guessing is robust.
+
+    Raises HTTPException on failure.
+    """
+    GRAPH = "https://graph.microsoft.com/v1.0"
+    auth_headers = {"Authorization": f"Bearer {_get_graph_app_token()}"}
+
+    parsed = urlparse(sharepoint_url)
+    hostname = parsed.netloc
+    path = unquote(parsed.path).lstrip("/")
+    path = re.sub(r"^:[a-z]:/[a-z]/", "", path)
+    parts = [p for p in path.split("/") if p]
+    if len(parts) < 2 or parts[0] not in ("sites", "teams"):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Could not parse SharePoint URL. Expected a path containing "
+                f"'sites/<name>' or 'teams/<name>'. Got: {sharepoint_url}"
+            ),
+        )
+    site_segment = f"{parts[0]}/{parts[1]}"
+    remaining = parts[2:]
+
+    site_resp = requests.get(
+        f"{GRAPH}/sites/{hostname}:/{site_segment}",
+        headers=auth_headers,
+        timeout=30,
+    )
+    if site_resp.status_code != 200:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to resolve SharePoint site: {site_resp.text}",
+        )
+    site_id = site_resp.json().get("id")
+
+    library_name = remaining[0] if remaining else None
+    folder_path_parts = remaining[1:] if remaining else []
+
+    drives_resp = requests.get(
+        f"{GRAPH}/sites/{site_id}/drives", headers=auth_headers, timeout=30
+    )
+    candidate_drives = []
+    seen = set()
+    if drives_resp.status_code == 200:
+        for d in drives_resp.json().get("value", []):
+            if d.get("id") and d["id"] not in seen:
+                candidate_drives.append(d)
+                seen.add(d["id"])
+    default_resp = requests.get(
+        f"{GRAPH}/sites/{site_id}/drive", headers=auth_headers, timeout=30
+    )
+    if default_resp.status_code == 200:
+        d = default_resp.json()
+        if d.get("id") and d["id"] not in seen:
+            candidate_drives.append(d)
+            seen.add(d["id"])
+    if not candidate_drives:
+        raise HTTPException(
+            status_code=502, detail="No SharePoint drives accessible for this site"
+        )
+    if library_name:
+        def _score(d):
+            name = d.get("name", "")
+            web = d.get("webUrl", "").rstrip("/")
+            if name == library_name:
+                return 0
+            if web.endswith("/" + library_name.replace(" ", "%20")):
+                return 1
+            return 2
+        candidate_drives.sort(key=_score)
+
+    def _walk(drive, segments):
+        drv_id = drive.get("id")
+        root_resp_local = requests.get(
+            f"{GRAPH}/drives/{drv_id}/root", headers=auth_headers, timeout=30
+        )
+        if root_resp_local.status_code != 200:
+            return None, f"root fetch failed: {root_resp_local.text}"
+        cursor = root_resp_local.json().get("id")
+        for segment in segments:
+            children_url = (
+                f"{GRAPH}/drives/{drv_id}/items/{cursor}/children"
+                f"?$top=200&$select=id,name,folder"
+            )
+            found_child = None
+            seen_names = []
+            while children_url:
+                ch_resp = requests.get(children_url, headers=auth_headers, timeout=30)
+                if ch_resp.status_code != 200:
+                    return None, f"children fetch failed: {ch_resp.text}"
+                ch_json = ch_resp.json()
+                for child in ch_json.get("value", []):
+                    seen_names.append(child.get("name", ""))
+                    if child.get("name", "").lower() == segment.lower():
+                        found_child = child
+                        break
+                if found_child:
+                    break
+                children_url = ch_json.get("@odata.nextLink")
+            if not found_child:
+                return None, (
+                    f"segment '{segment}' not found; available: {seen_names[:20]}"
+                )
+            cursor = found_child["id"]
+        return cursor, None
+
+    attempt_segments = [folder_path_parts]
+    if folder_path_parts != remaining:
+        attempt_segments.append(remaining)
+
+    diagnostics = []
+    for d in candidate_drives:
+        for segs in attempt_segments:
+            fid, err = _walk(d, segs)
+            if fid:
+                return d.get("id"), fid
+            diagnostics.append(
+                f"drive '{d.get('name')}' ({d.get('id')}) segs={segs}: {err}"
+            )
+
+    raise HTTPException(
+        status_code=502,
+        detail=(
+            f"Failed to resolve folder path '{'/'.join(remaining)}'. "
+            f"Diagnostics: {diagnostics}"
+        ),
+    )
+
 # Initialize S3 client
 s3_client = None
 try:
@@ -244,7 +386,7 @@ async def root():
     return {
         "message": "Logic Provider Functions API", 
         "status": "running",
-        "endpoints": ["/upload-html", "/generate-image", "/html-to-image", "/optimize-image-to-s3", "/process-loom-video", "/upload-linkedin-video", "/url-to-google-drive", "/eleven-labs-speech", "/heygen-avatar-iv", "/google-drive-to-s3", "/telegram-file/bot{BotToken}/{file_path}", "/transcribe-audio", "/analyze-images", "/markdown-to-docx", "/upload-to-sharepoint", "/health"],
+        "endpoints": ["/upload-html", "/generate-image", "/html-to-image", "/optimize-image-to-s3", "/process-loom-video", "/upload-linkedin-video", "/url-to-google-drive", "/eleven-labs-speech", "/heygen-avatar-iv", "/google-drive-to-s3", "/telegram-file/bot{BotToken}/{file_path}", "/transcribe-audio", "/analyze-images", "/markdown-to-docx", "/upload-to-sharepoint", "/create-sharepoint-folder", "/health"],
         "aws_configured": bool(AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY and S3_BUCKET_NAME),
         "timestamp": datetime.now().isoformat()
     }
@@ -3085,6 +3227,81 @@ async def markdown_to_docx(request: MarkdownToDocxRequest):
     except Exception as e:
         logger.error(f"Error converting markdown to docx: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to convert markdown: {str(e)}")
+
+@app.post("/create-sharepoint-folder")
+async def create_sharepoint_folder(request: CreateSharepointFolderRequest):
+    """
+    Create a folder inside a SharePoint folder via Microsoft Graph using
+    app-only auth.
+
+    Body:
+        sharepoint_url: SharePoint URL of the parent folder
+        folder_name: Name of the new folder to create
+        conflict_behavior: "rename" (default), "replace", or "fail"
+    """
+    logger.info(
+        f"Create-sharepoint-folder request - parent: {request.sharepoint_url}, "
+        f"name: {request.folder_name}"
+    )
+
+    folder_name = (request.folder_name or "").strip()
+    if not folder_name:
+        raise HTTPException(status_code=400, detail="folder_name is required")
+    if any(c in folder_name for c in '\\/:*?"<>|'):
+        raise HTTPException(
+            status_code=400,
+            detail='folder_name contains invalid characters: \\/:*?"<>|',
+        )
+
+    conflict = request.conflict_behavior or "rename"
+    if conflict not in ("rename", "replace", "fail"):
+        raise HTTPException(
+            status_code=400,
+            detail="conflict_behavior must be 'rename', 'replace', or 'fail'",
+        )
+
+    GRAPH = "https://graph.microsoft.com/v1.0"
+    drive_id, parent_id = _resolve_sharepoint_folder(request.sharepoint_url)
+    auth_headers = {"Authorization": f"Bearer {_get_graph_app_token()}"}
+
+    create_resp = requests.post(
+        f"{GRAPH}/drives/{drive_id}/items/{parent_id}/children",
+        headers={**auth_headers, "Content-Type": "application/json"},
+        json={
+            "name": folder_name,
+            "folder": {},
+            "@microsoft.graph.conflictBehavior": conflict,
+        },
+        timeout=30,
+    )
+    if create_resp.status_code not in (200, 201):
+        logger.error(
+            f"Folder creation failed: {create_resp.status_code} {create_resp.text}"
+        )
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to create SharePoint folder: {create_resp.text}",
+        )
+
+    item = create_resp.json()
+    logger.info(
+        f"Created SharePoint folder id={item.get('id')} name={item.get('name')}"
+    )
+
+    return JSONResponse(
+        status_code=200,
+        content={
+            "success": True,
+            "message": "Folder created successfully",
+            "item_id": item.get("id"),
+            "name": item.get("name"),
+            "web_url": item.get("webUrl"),
+            "drive_id": drive_id,
+            "parent_folder_id": parent_id,
+            "created_at": datetime.now().isoformat(),
+        },
+    )
+
 
 @app.post("/upload-to-sharepoint")
 async def upload_to_sharepoint(request: UploadToSharepointRequest):
