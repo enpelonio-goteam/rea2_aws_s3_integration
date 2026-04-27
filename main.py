@@ -3079,6 +3079,7 @@ async def upload_to_sharepoint(
     try:
         drive_id = None
         folder_id = None
+        share_attempt_log = []  # collected for diagnostics if everything fails
 
         # 1a. Try resolving as a Graph sharing link first.
         #     Using `Prefer: redeemSharingLink` makes Graph redeem the link's
@@ -3091,23 +3092,26 @@ async def upload_to_sharepoint(
             .rstrip("=")
         )
         share_id = f"u!{share_b64}"
-        share_resp = requests.get(
-            f"{GRAPH}/shares/{share_id}/driveItem",
-            headers={**auth_headers, "Prefer": "redeemSharingLink"},
-            timeout=30,
-        )
-        # Some link types prefer `redeemSharingLinkIfNecessary` — retry with
-        # that variant if the first request didn't resolve cleanly.
-        if share_resp.status_code != 200:
-            logger.info(
-                f"/shares with redeemSharingLink failed "
-                f"({share_resp.status_code}); retrying with redeemSharingLinkIfNecessary"
-            )
-            share_resp = requests.get(
+        # Try a few prefer-header variants. Some sharing URLs need redemption,
+        # some don't, and the right header depends on the link type.
+        share_resp = None
+        for prefer in ("redeemSharingLink", "redeemSharingLinkIfNecessary", None):
+            headers = dict(auth_headers)
+            if prefer:
+                headers["Prefer"] = prefer
+            r = requests.get(
                 f"{GRAPH}/shares/{share_id}/driveItem",
-                headers={**auth_headers, "Prefer": "redeemSharingLinkIfNecessary"},
+                headers=headers,
                 timeout=30,
             )
+            share_attempt_log.append(
+                f"prefer={prefer or 'none'} status={r.status_code} "
+                f"body={r.text[:300]}"
+            )
+            if r.status_code == 200:
+                share_resp = r
+                break
+            share_resp = r  # keep latest for fallback decision
 
         if share_resp.status_code == 200:
             share_item = share_resp.json()
@@ -3274,8 +3278,9 @@ async def upload_to_sharepoint(
                 raise HTTPException(
                     status_code=502,
                     detail=(
-                        f"Failed to resolve folder path '{'/'.join(remaining)}' "
-                        f"in any drive of site. Diagnostics: {diagnostics}"
+                        f"Failed to resolve folder path '{'/'.join(remaining)}'. "
+                        f"/shares attempts: {share_attempt_log}. "
+                        f"Path-walk diagnostics: {diagnostics}"
                     ),
                 )
 
