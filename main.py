@@ -3080,8 +3080,11 @@ async def upload_to_sharepoint(
         drive_id = None
         folder_id = None
 
-        # 1a. Try resolving as a Graph sharing link first (works for real
-        #     "Share -> Copy link" URLs of the form .../:f:/s/...).
+        # 1a. Try resolving as a Graph sharing link first.
+        #     Using `Prefer: redeemSharingLink` makes Graph redeem the link's
+        #     permission for the caller, which is necessary for browser-copied
+        #     URLs (`:f:/r/...?e=<token>`) where the caller's only access is
+        #     via that link.
         share_b64 = (
             base64.urlsafe_b64encode(request.sharepoint_url.encode("utf-8"))
             .decode("ascii")
@@ -3090,9 +3093,21 @@ async def upload_to_sharepoint(
         share_id = f"u!{share_b64}"
         share_resp = requests.get(
             f"{GRAPH}/shares/{share_id}/driveItem",
-            headers=auth_headers,
+            headers={**auth_headers, "Prefer": "redeemSharingLink"},
             timeout=30,
         )
+        # Some link types prefer `redeemSharingLinkIfNecessary` — retry with
+        # that variant if the first request didn't resolve cleanly.
+        if share_resp.status_code != 200:
+            logger.info(
+                f"/shares with redeemSharingLink failed "
+                f"({share_resp.status_code}); retrying with redeemSharingLinkIfNecessary"
+            )
+            share_resp = requests.get(
+                f"{GRAPH}/shares/{share_id}/driveItem",
+                headers={**auth_headers, "Prefer": "redeemSharingLinkIfNecessary"},
+                timeout=30,
+            )
 
         if share_resp.status_code == 200:
             share_item = share_resp.json()
